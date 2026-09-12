@@ -1,0 +1,16 @@
+[project]
+name = "kunoworld"
+version = "0.1.0"
+description = "KunoWorld Python SDK: private video generation with end-to-end encryption to attested GPU enclaves"
+requires-python = ">=3.10"
+dependencies = [
+    "kuno-protocol",
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kunoworld"]
