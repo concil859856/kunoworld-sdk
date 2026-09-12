@@ -27,6 +27,12 @@ export function enclaveIdFor(hpkePublicKey: Uint8Array, signingPublicKey: Uint8A
   return toHex(sha256(concatBytes(hpkePublicKey, signingPublicKey))).slice(0, 32);
 }
 
+/** The nonce GPU evidence must be collected for, so evidence cannot be borrowed from another machine. */
+export function gpuNonceFor(nonce: Uint8Array, hpkePublicKey: Uint8Array, signingPublicKey: Uint8Array): Uint8Array {
+  const binding = sha256(concatBytes(hpkePublicKey, signingPublicKey));
+  return sha256(concatBytes(utf8("kuno/v1/gpu"), nonce, binding));
+}
+
 export function reportDataFor(
   nonce: Uint8Array,
   hpkePublicKey: Uint8Array,

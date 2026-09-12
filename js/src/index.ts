@@ -12,7 +12,7 @@
 export * from "./types.js";
 export { KunoClient, KunoError, fitParams, inferMode, jobAad, priceUsd, sniffMime, verifyReceipt } from "./client.js";
 export type { GenerateInput, GenerateRequest, GenerationResult, JobHandle, KunoClientOptions, SubmitStage } from "./client.js";
-export { enclaveIdFor, parseTdxQuote, reportDataFor, verifyEvidence } from "./attestation.js";
+export { enclaveIdFor, gpuNonceFor, parseTdxQuote, reportDataFor, verifyEvidence } from "./attestation.js";
 export type { Verdict } from "./attestation.js";
 export { DecryptionError, decryptBlob, encryptBlob, openSenderSession, sha256Hex } from "./crypto.js";
 export { b64d, b64e, canonicalJson, fromHex, toHex } from "./encoding.js";
