@@ -9,10 +9,13 @@
 By default (privacy="private") prompts and media are encrypted on your machine to a GPU enclave
 whose attestation the SDK verifies first, and the platform only relays ciphertext. With
 privacy="standard" they are sent to KunoWorld readable instead: KunoWorld and the GPU provider
-can see them.
+can see them. In both modes videos are kept until you delete them (`client.delete(job_id)`).
+
+API keys are for developers' own programs. The KunoWorld website uses email sign-in instead.
 """
 
 from .client import (
+    ERROR_CODES,
     GenerationResult,
     Input,
     KunoClient,
@@ -24,6 +27,7 @@ from .client import (
 )
 
 __all__ = [
+    "ERROR_CODES",
     "GenerationResult",
     "Input",
     "KunoClient",

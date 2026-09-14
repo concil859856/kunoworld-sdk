@@ -6,7 +6,25 @@ enclave-signed receipt; and decrypts the finished video locally. Cryptography us
 so it runs in modern browsers and Node.js 20+. The package is ES modules only.
 
 > **Development preview.** Workers on development gateways use simulated attestation and may
-> return placeholder video. Real TDX and NVIDIA evidence verification is not built yet.
+> return placeholder video. Real TDX and NVIDIA evidence verification is not built yet. Prices
+> are placeholders that haven't been set (`models()` may return `pricing_placeholder: true`).
+
+## Who this is for
+
+**API keys are for developers**, calling KunoWorld from programs they run. People using the
+KunoWorld website sign in with their email instead: the site's server keeps the session in an
+HttpOnly cookie and forwards the studio's requests, so no key or token ever reaches the page.
+Never put an API key in a web page or a frontend build variable.
+
+A website of your own can do the same with a same-origin proxy that adds credentials on the
+server side:
+
+```js
+// In the browser. The proxy forwards /api/kuno/* to the gateway with the visitor's credentials.
+const kuno = KunoClient.forProxy("/api/kuno");
+```
+
+Private jobs are still encrypted in the page, so the proxy only relays ciphertext.
 
 ## Install
 
@@ -51,19 +69,24 @@ await writeFile("my-world.mp4", video);
 await writeFile("my-world.receipt.json", JSON.stringify(receipt, null, 2));
 ```
 
-Never put a server API key in a frontend build variable.
+Never put an API key in a web page or a frontend build variable.
 
 ## Private or Standard
 
-Every job has a privacy mode, set with `privacy`:
+Every job has a privacy mode, set with `privacy`. In both modes the video is stored on
+KunoWorld's object storage (Cloudflare R2) **until you delete it**; nothing expires on its own.
 
 - `"private"` (the default) is everything above: encrypted in this process to an attested
   confidential enclave, and opened only with the handle's `outputKey`. Nobody at KunoWorld can
-  read it. Private jobs only ever run on confidential-tier miners.
+  read it, and nobody can recover a lost key: a lost handle means a lost video. Private jobs only
+  ever run on confidential-tier miners.
 - `"standard"` sends the prompt and inputs to KunoWorld readable. **KunoWorld and the GPU provider
   can see the video and your prompt.** There is no client-side encryption and no key to keep; the
-  job can run on any miner, and KunoWorld keeps the video, prompt and inputs (30 days by default)
-  so the account's credentials can fetch them again.
+  job can run on any miner, and only your account's credentials can fetch the video again.
+
+KunoWorld operators can open a video only when it is reported as child sexual abuse material (or
+sexual content involving a minor) or is under a legal hold, and every such view is logged. There
+is no sampled review. All NSFW content is banned in both modes.
 
 ```js
 const job = await kuno.submit({ prompt: "A paper boat crosses a rain puddle", model: "ltx-2.5-fast", privacy: "standard" });
@@ -71,8 +94,12 @@ const { video, receipt } = await kuno.wait(job);   // downloads the stored video
 
 const [latest] = await kuno.listStandard();         // this account's standard jobs, newest first
 const poster = await kuno.standardThumbnail(latest.job_id);
-await kuno.deleteStandard(latest.job_id);           // deletes the stored video, prompt and inputs
+
+await kuno.delete(job.jobId);                       // either mode: deletes the stored content for good
 ```
+
+`delete` removes a private job's sealed files, or a standard job's video, prompt, inputs and
+preview. The charge record and the receipt stay.
 
 `kuno.generate(request, options)` submits and waits in one call, in either mode. Every
 `JobStatus` carries `privacy`.
@@ -91,9 +118,16 @@ strikes_24h, strikes_7d }`.
 | `upload_blocked` (422) | a standard upload matched the content scan |
 | `scan_unavailable` (503) | the upload scanner couldn't be reached; nothing was charged, try again |
 | `unsupported_media` (422) | the gateway didn't recognize an upload's type (it reads the bytes, not the content-type) |
+| `content_policy` (422) | a standard job breaks the content policy (all NSFW is banned); not created, nothing charged |
 | `safety_blocked` | the in-enclave content check stopped the job; it counts as a strike |
 | `bad_output` | the video didn't match its receipt, so the job failed and was refunded |
-| `expired` / `deleted` / `removed` (410) | a standard video or thumbnail is past retention, was deleted, or was removed after review |
+| `deleted` / `removed` (410) | the video was deleted by its owner, or removed after review |
+| `key_not_accepted` (422) | a report carried an `output_key` but its reason isn't `csam` or `sexual_minor` |
+| `content_not_reviewable` (403) | operator API: the item can't be opened (not a CSAM/sexual-minor report, no matching legal hold) |
+| `gone` (410) | a retired endpoint or credential, such as a `kwt_` studio token |
+
+`ERROR_CODES` maps these codes to a sentence, `err.explanation` reads it for an error, and
+`err.isContentPolicy` is true for `content_policy` and `safety_blocked`.
 
 The rest of an error body is on `err.details`. An indefinite restriction (until an operator
 reviews the account) has `restrictedUntil` 253402300799, in year 9999; it is never null while an
@@ -107,8 +141,9 @@ await kuno.report({ content_digest: sha256, reason: "copyright", details: "This 
 
 Reports are sent without your API key. `reason` is one of `csam`, `sexual_minor`,
 `nonconsensual_intimate`, `violent_extremism`, `harassment`, `copyright` or `other`; identify
-the video with `content_digest`, `job_id` or `url`. Include `output_key` only for a private video
-you were given with its key and want reviewed: it opens that one video.
+the video with `content_digest`, `job_id` or `url`. `output_key` is accepted only for `csam` and
+`sexual_minor` reports, for a private video you were given with its key: it lets a reviewer open
+that one video, and the view is logged.
 
 ## Inputs and modes
 
@@ -141,7 +176,8 @@ rate to it. The handle and the result carry `profileId` and `fallbackReason`
 ## The job handle is a secret
 
 `submit` returns a `JobHandle` containing `outputKey`, the only key that decrypts the result.
-Store it like a password. With it you can fetch and decrypt the film later:
+Store it like a password, and back it up: KunoWorld can't recover it, and the encrypted video is
+kept until you delete it but opens only with this key. With it you can fetch and decrypt the film later:
 
 ```js
 const result = await kuno.result(handle);
@@ -149,8 +185,11 @@ const result = await kuno.result(handle);
 
 ## Client reference
 
-`new KunoClient({ apiKey, baseUrl, manifest, country, fetch })` — `baseUrl` defaults to
-`https://api.kunoworld.com`; `country` is for development gateways only.
+`new KunoClient({ apiKey, baseUrl, manifest, country, fetch, credentials })` — `baseUrl` defaults
+to `https://api.kunoworld.com` and may be a same-origin path in a browser; `apiKey` is optional
+(leave it out behind a proxy); `fetch` replaces the transport; `country` is for development
+gateways only. `KunoClient.forProxy(baseUrl, opts?)` is the keyless form for a same-origin proxy.
+A `kwt_` studio token is refused with `gone`.
 
 | Method | What it does |
 |---|---|
@@ -163,8 +202,9 @@ const result = await kuno.result(handle);
 | `result(handle, status?)` | fetch a finished job's video |
 | `status(jobId)` / `list(limit = 50)` | job status (including `privacy`), or your recent jobs |
 | `cancel(jobId)` | request cancellation. Stopping polling does not cancel a job |
+| `delete(jobId)` | delete a job's stored content, in either mode (`DELETE /v1/videos/{id}`) |
 | `listStandard(limit = 50)` / `standardHandle(row)` | your standard jobs, and a handle to wait on one |
-| `standardVideo(jobId)` / `standardThumbnail(jobId)` / `deleteStandard(jobId)` | a standard job's video, a JPEG frame, or delete it |
+| `standardVideo(jobId)` / `standardThumbnail(jobId)` / `deleteStandard(jobId)` | a standard job's video, a JPEG frame, or delete it (same as `delete`) |
 | `uploadStandard(role, file, mime?)` | upload one standard input yourself |
 | `eligibility()` | private-mode eligibility, restriction and strike counts |
 | `report(request)` | report a video (no credential sent) |

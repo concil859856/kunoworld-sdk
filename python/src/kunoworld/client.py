@@ -34,6 +34,30 @@ ProgressFn = Callable[[JobStatus], None]
 Privacy = Literal["private", "standard"]
 
 REPORT_REASONS = ("csam", "sexual_minor", "nonconsensual_intimate", "violent_extremism", "harassment", "copyright", "other")
+# The only report reasons for which the gateway accepts a private video's output key.
+KEY_REPORT_REASONS = ("csam", "sexual_minor")
+
+# Error codes callers commonly branch on, and what each means. The gateway may send others;
+# `KunoError.code` is always the raw string.
+ERROR_CODES: dict[str, str] = {
+    "unauthorized": "The API key was missing, unknown or revoked.",
+    "gone": "This endpoint or credential was retired. Studio tokens (kwt_...) no longer work: use an API key.",
+    "content_policy": "The request breaks the content policy, so the job wasn't created. All NSFW content is banned in "
+    "both modes. Nothing was charged.",
+    "safety_blocked": "The content check inside the enclave blocked the request before rendering. It counts as a strike.",
+    "content_not_reviewable": "Operators only: this item's content can't be opened, because it isn't a report of child "
+    "sexual abuse material or sexual content involving a minor, and no matching legal hold covers it.",
+    "key_not_accepted": "An output_key can be attached to a report only when the reason is csam or sexual_minor.",
+    "private_mode_not_eligible": "This account can't make private jobs yet; see `reasons`.",
+    "account_restricted": "The account is restricted; see `restricted_until`.",
+    "upload_blocked": "A Standard upload was refused by the scan.",
+    "insufficient_balance": "The balance doesn't cover the job's price.",
+    "not_found": "No such job, blob or video on this account.",
+    "deleted": "The owner deleted this video.",
+    "removed": "The video was removed after a review under the content policy.",
+    "not_ready": "The job hasn't finished yet.",
+    "integrity": "What came back didn't match the enclave-signed receipt.",
+}
 
 
 class KunoError(Exception):
@@ -44,6 +68,16 @@ class KunoError(Exception):
         super().__init__(f"{code}: {message}")
         self.status, self.code, self.message = status, code, message
         self.details: dict[str, Any] = details or {}
+
+    @property
+    def is_content_policy(self) -> bool:
+        """The request broke the content policy: `content_policy` (Standard) or `safety_blocked` (Private)."""
+        return self.code in ("content_policy", "safety_blocked")
+
+    @property
+    def explanation(self) -> str | None:
+        """What this code means, when it's one the gateway documents."""
+        return ERROR_CODES.get(self.code)
 
     @property
     def reasons(self) -> list[str]:
@@ -138,6 +172,10 @@ class KunoClient:
         timeout: float = 60.0,
         transport: httpx.BaseTransport | None = None,
     ):
+        """`api_key` is a developer API key from your account page. The KunoWorld website itself uses
+        email sign-in; API keys are for your own programs and must never be shipped to a browser."""
+        if api_key.startswith("kwt_"):
+            raise KunoError(410, "gone", ERROR_CODES["gone"])
         headers = {"authorization": f"Bearer {api_key}"}
         if country:
             headers["x-kuno-country"] = country
@@ -235,12 +273,15 @@ class KunoClient:
         """Reports a video, identified by at least one of `content_digest`, `job_id` or `url`.
         No credential is sent. Returns the report id.
 
-        `output_key` (base64url) is the key of a private video you received; include it only if you
-        want KunoWorld to be able to review that one video."""
+        `output_key` (base64url) is the key of a private video you received. It is accepted only for
+        `csam` and `sexual_minor` reports, so that a reviewer can open that one video; the gateway
+        refuses it for other reasons with `key_not_accepted`, and so does this method, before sending."""
         if reason not in REPORT_REASONS:
             raise KunoError(0, "invalid_reason", f"reason must be one of {', '.join(REPORT_REASONS)}.")
         if not (content_digest or job_id or url):
             raise KunoError(0, "invalid_report", "Identify the video by content_digest, job_id or url.")
+        if output_key and reason not in KEY_REPORT_REASONS:
+            raise KunoError(0, "key_not_accepted", ERROR_CODES["key_not_accepted"])
         fields = {
             "content_digest": content_digest,
             "job_id": job_id,
@@ -258,6 +299,12 @@ class KunoClient:
     def standard_videos(self, limit: int = 50) -> list[dict]:
         """This account's standard jobs, newest first."""
         return self._request("GET", "/v1/standard/videos", params={"limit": limit}).json()
+
+    def delete(self, job_id: str) -> None:
+        """Deletes a job's stored content, in either mode: a private job's sealed files, or a standard
+        job's video, prompt, inputs and preview. Videos are kept until their owner deletes them; the
+        charge record and receipt stay. A private job's output key opens nothing afterwards."""
+        self._request("DELETE", f"/v1/videos/{job_id}")
 
     def standard_job(self, job_id: str, profile_id: str = "") -> StandardVideoJob:
         """A handle on an existing standard job, to wait on, download or delete it."""
@@ -537,6 +584,10 @@ class VideoJob:
     def cancel(self) -> JobStatus:
         return JobStatus.model_validate(self.client._request("POST", f"/v1/videos/{self.job_id}/cancel").json())
 
+    def delete(self) -> None:
+        """Deletes the sealed video and inputs stored for this job. Discard the exported handle too."""
+        self.client.delete(self.job_id)
+
     def wait(self, timeout: float = 1800.0, poll_s: float = 1.0, on_progress: ProgressFn | None = None) -> GenerationResult:
         return _wait(self, timeout, poll_s, on_progress)
 
@@ -604,8 +655,8 @@ class StandardVideoJob:
         return self.client._request("GET", f"/v1/standard/videos/{self.job_id}/thumbnail").content
 
     def delete(self) -> None:
-        """Deletes the stored video, prompt and inputs. The billing record stays."""
-        self.client._request("DELETE", f"/v1/standard/videos/{self.job_id}")
+        """Deletes the stored video, prompt, inputs and preview. The billing record stays."""
+        self.client.delete(self.job_id)
 
 
 def _wait(

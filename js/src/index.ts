@@ -10,8 +10,9 @@
  */
 
 export * from "./types.js";
-export { KunoClient, KunoError, fitParams, inferMode, isStandardHandle, jobAad, priceUsd, sniffMime, verifyReceipt } from "./client.js";
+export { ERROR_CODES, KunoClient, KunoError, fitParams, inferMode, isStandardHandle, jobAad, priceUsd, sniffMime, verifyReceipt } from "./client.js";
 export type {
+  KunoErrorCode,
   AnyJobHandle,
   GenerateInput,
   GenerateRequest,

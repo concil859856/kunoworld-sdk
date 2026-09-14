@@ -96,6 +96,8 @@ export interface ModelsResponse {
   workers_online: number;
   switch: SwitchConfig;
   models: ModelProfile[];
+  /** True while the listed prices are placeholders that haven't been set yet. */
+  pricing_placeholder?: boolean;
 }
 
 export interface GenerationParams {
@@ -249,13 +251,11 @@ export interface StandardVideoSummary {
   finished_at: number | null;
   has_video: boolean;
   error_code: string | null;
-  /** When the stored video, prompt and inputs are deleted (Unix seconds). */
-  expires_at: number | null;
-  /** Deleted by the owner or removed after review; the row stays for billing. */
+  /** Deleted by the owner or removed after review; the row stays for billing. Nothing expires on its own. */
   deleted: boolean;
 }
 
-/** `GET /v1/account/eligibility` (API key or studio token) and `GET /v1/me/eligibility` (web session). */
+/** `GET /v1/account/eligibility` (API key or web session) and `GET /v1/me/eligibility` (web session). */
 export interface Eligibility {
   private_mode: { eligible: boolean; reasons: string[] };
   /**
@@ -283,7 +283,10 @@ export interface ReportRequest {
   url?: string;
   reason: ReportReason;
   details?: string;
-  /** Base64url output key of a private video, so that one video can be reviewed. */
+  /**
+   * Base64url output key of a private video, so that one video can be reviewed. Accepted only when
+   * `reason` is `csam` or `sexual_minor`; otherwise the gateway answers `422 key_not_accepted`.
+   */
   output_key?: string;
   contact_email?: string;
 }

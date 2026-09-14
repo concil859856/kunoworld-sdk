@@ -207,7 +207,7 @@ def test_reports_are_sent_without_a_credential_and_library_calls_with_one():
             "POST /v1/reports": lambda r: httpx.Response(202, json={"report_id": "rep-1"}),
             "GET /v1/standard/videos": lambda r: httpx.Response(200, json=[{"job_id": "a", "status": "succeeded"}]),
             "GET /v1/standard/videos/a/thumbnail": lambda r: httpx.Response(200, content=b"\xff\xd8\xff"),
-            "DELETE /v1/standard/videos/a": lambda r: httpx.Response(204),
+            "DELETE /v1/videos/a": lambda r: httpx.Response(204),
             "GET /v1/account/eligibility": lambda r: httpx.Response(
                 200, json={"private_mode": {"eligible": True, "reasons": []}, "restricted_until": None, "strikes_24h": 0, "strikes_7d": 1}
             ),
@@ -237,6 +237,62 @@ def test_report_requires_a_known_reason_and_something_to_identify_the_video():
     with pytest.raises(KunoError) as nothing:
         client.report("other")
     assert nothing.value.code == "invalid_report"
+
+
+def test_an_output_key_is_sent_only_with_child_safety_reports():
+    gateway = FakeGateway({"POST /v1/reports": lambda r: httpx.Response(202, json={"report_id": "rep-2"})})
+    client = gateway.client()
+    key = "A" * 43
+
+    with pytest.raises(KunoError) as refused:
+        client.report("copyright", job_id="a", output_key=key)
+    assert refused.value.code == "key_not_accepted"
+    assert gateway.calls == [], "nothing is sent when the key would be refused"
+
+    assert client.report("csam", job_id="a", output_key=key) == "rep-2"
+    assert json.loads(gateway.calls[0].content)["output_key"] == key
+
+
+def test_delete_uses_the_one_endpoint_for_both_modes():
+    gateway = FakeGateway({"DELETE /v1/videos/*": lambda r: httpx.Response(204)})
+    client = gateway.client()
+
+    client.delete("private-1")
+    StandardVideoJob(client, "standard-1", PROFILE.id).delete()
+    from kunoworld import VideoJob
+
+    VideoJob(client, "private-2", b"\0" * 32, b"\0" * 32, PROFILE.id).delete()
+    assert gateway.paths() == ["DELETE /v1/videos/private-1", "DELETE /v1/videos/standard-1", "DELETE /v1/videos/private-2"]
+
+
+def test_a_failed_delete_and_the_new_error_codes_explain_themselves():
+    gateway = FakeGateway(
+        {
+            "DELETE /v1/videos/missing": lambda r: detail(404, code="not_found", message="No such job."),
+            "POST /v1/standard/videos": lambda r: detail(422, code="content_policy", message="This request breaks the content policy."),
+        }
+    )
+    client = gateway.client()
+    with pytest.raises(KunoError) as missing:
+        client.delete("missing")
+    assert (missing.value.status, missing.value.code) == (404, "not_found")
+
+    with pytest.raises(KunoError) as policy:
+        client._request("POST", "/v1/standard/videos", json={})
+    assert policy.value.code == "content_policy" and policy.value.is_content_policy
+    assert "NSFW" in (policy.value.explanation or "")
+
+    from kunoworld import ERROR_CODES
+
+    for code in ("content_policy", "content_not_reviewable", "key_not_accepted", "gone"):
+        assert code in ERROR_CODES
+    assert KunoError(0, "something_new", "").explanation is None
+
+
+def test_studio_tokens_are_refused():
+    with pytest.raises(KunoError) as exc:
+        KunoClient("kwt_abc", "https://gw.test")
+    assert (exc.value.status, exc.value.code) == (410, "gone")
 
 
 def test_privacy_must_be_a_known_mode_and_job_status_defaults_to_private():

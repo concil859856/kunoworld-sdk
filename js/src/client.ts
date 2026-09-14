@@ -47,7 +47,42 @@ export class KunoError extends Error {
   get restrictedUntil(): number | null {
     return typeof this.details.restricted_until === "number" ? this.details.restricted_until : null;
   }
+
+  /** The request broke the content policy: `content_policy` (Standard) or `safety_blocked` (Private, in the enclave). */
+  get isContentPolicy(): boolean {
+    return this.code === "content_policy" || this.code === "safety_blocked";
+  }
+
+  /** What this code means, when it's one the gateway documents; otherwise null. */
+  get explanation(): string | null {
+    return ERROR_CODES[this.code as KunoErrorCode] ?? null;
+  }
 }
+
+/**
+ * Error codes callers commonly branch on, and what each means. The gateway may send others;
+ * `KunoError.code` is always the raw string.
+ */
+export const ERROR_CODES = {
+  unauthorized: "The API key (or web session) was missing, unknown or revoked.",
+  gone: "This endpoint or credential was retired. Studio tokens (kwt_…) no longer work: use an API key, or a same-origin proxy that holds a web session.",
+  content_policy: "The request breaks the content policy, so the job wasn't created. All NSFW content is banned in both modes. Nothing was charged.",
+  safety_blocked: "The content check inside the enclave blocked the request before rendering. It counts as a strike.",
+  content_not_reviewable: "Operators only: this item's content can't be opened, because it isn't a report of child sexual abuse material or sexual content involving a minor, and no matching legal hold covers it.",
+  key_not_accepted: "An output_key can be attached to a report only when the reason is csam or sexual_minor.",
+  private_mode_not_eligible: "This account can't make private jobs yet; see `reasons`.",
+  account_restricted: "The account is restricted; see `restricted_until`.",
+  upload_blocked: "A Standard upload was refused by the scan.",
+  insufficient_balance: "The balance doesn't cover the job's price.",
+  not_found: "No such job, blob or video on this account.",
+  deleted: "The owner deleted this video.",
+  removed: "The video was removed after a review under the content policy.",
+  not_ready: "The job hasn't finished yet.",
+  integrity: "What came back didn't match the enclave-signed receipt.",
+  decrypt_failed: "The video didn't open with this handle's output key.",
+} as const;
+
+export type KunoErrorCode = keyof typeof ERROR_CODES;
 
 export interface GenerateInput {
   role: InputRole;
@@ -130,13 +165,25 @@ export interface WaitOptions {
 }
 
 export interface KunoClientOptions {
+  /**
+   * A developer API key (`kw_live_…`), for programs you run yourself. Leave it out when `baseUrl`
+   * is a same-origin proxy that authenticates for you (the KunoWorld website uses the signed-in
+   * session that way); never put an API key in a web page.
+   */
   apiKey?: string;
+  /**
+   * The gateway, e.g. `https://api.kunoworld.com`, or in a browser a same-origin path such as
+   * `/api/kuno` that forwards to it.
+   */
   baseUrl?: string;
   /** Pin the published golden manifest for zero-trust verification. */
   manifest?: GoldenManifest;
   /** Development only: pretend to be in another country. */
   country?: string;
+  /** Replaces `fetch`, e.g. to add timeouts or route requests through your own transport. */
   fetch?: typeof fetch;
+  /** Passed to every fetch. A same-origin proxy relies on the default, `same-origin`, to send its cookie. */
+  credentials?: RequestCredentials;
 }
 
 const MIME_SIGNATURES: Array<[string, (b: Uint8Array) => boolean]> = [
@@ -229,9 +276,21 @@ export class KunoClient {
   private modelsCache: { at: number; value: ModelsResponse } | undefined;
 
   constructor(private readonly opts: KunoClientOptions = {}) {
-    this.baseUrl = (opts.baseUrl ?? "https://api.kunoworld.com").replace(/\/$/, "");
+    if (opts.apiKey?.startsWith("kwt_")) {
+      throw new KunoError(410, "gone", ERROR_CODES.gone);
+    }
+    this.baseUrl = (opts.baseUrl ?? "https://api.kunoworld.com").replace(/\/+$/, "");
     this.fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
     this.manifestCache = opts.manifest;
+  }
+
+  /**
+   * A client for a same-origin proxy that adds the credentials itself, such as a website that
+   * forwards `/api/kuno/*` to the gateway with the visitor's session. No key is held in the page;
+   * private jobs are still encrypted here, so the proxy only ever relays ciphertext.
+   */
+  static forProxy(baseUrl: string, opts: Omit<KunoClientOptions, "apiKey" | "baseUrl"> = {}): KunoClient {
+    return new KunoClient({ credentials: "same-origin", ...opts, baseUrl });
   }
 
   private async request(method: string, path: string, body?: BodyInit, contentType?: string, auth = true): Promise<Response> {
@@ -239,7 +298,9 @@ export class KunoClient {
     if (auth && this.opts.apiKey) headers.authorization = `Bearer ${this.opts.apiKey}`;
     if (this.opts.country) headers["x-kuno-country"] = this.opts.country;
     if (contentType) headers["content-type"] = contentType;
-    const response = await this.fetchImpl(`${this.baseUrl}${path}`, { method, headers, body });
+    const init: RequestInit = { method, headers, body };
+    if (this.opts.credentials) init.credentials = this.opts.credentials;
+    const response = await this.fetchImpl(`${this.baseUrl}${path}`, init);
     if (!response.ok) {
       let detail: Record<string, unknown> = {};
       try {
@@ -469,6 +530,15 @@ export class KunoClient {
     return this.json<JobStatus>("POST", `/v1/videos/${jobId}/cancel`);
   }
 
+  /**
+   * Deletes a job's stored content, in either mode: a private job's sealed files, or a standard
+   * job's video, prompt, inputs and preview. Videos are kept until their owner deletes them; the
+   * charge record and receipt stay. A private job's output key is useless afterwards, so drop it too.
+   */
+  async delete(jobId: string): Promise<void> {
+    await this.request("DELETE", `/v1/videos/${encodeURIComponent(jobId)}`);
+  }
+
   async wait(handle: AnyJobHandle, opts: WaitOptions = {}): Promise<GenerationResult> {
     const deadline = Date.now() + (opts.timeoutMs ?? 30 * 60 * 1000);
     for (;;) {
@@ -536,7 +606,7 @@ export class KunoClient {
     return this.json<StandardVideoSummary[]>("GET", `/v1/standard/videos?limit=${limit}`);
   }
 
-  /** A standard job's video (`not_ready` until it succeeds, `expired` after retention). */
+  /** A standard job's video (`not_ready` until it succeeds; `deleted` or `removed` once it's gone). */
   async standardVideo(jobId: string): Promise<Uint8Array> {
     return new Uint8Array(await (await this.request("GET", `/v1/standard/videos/${encodeURIComponent(jobId)}/video`)).arrayBuffer());
   }
@@ -546,7 +616,7 @@ export class KunoClient {
     return new Uint8Array(await (await this.request("GET", `/v1/standard/videos/${encodeURIComponent(jobId)}/thumbnail`)).arrayBuffer());
   }
 
-  /** Deletes the stored video, prompt and inputs of a standard job. The billing record stays. */
+  /** Deletes the stored video, prompt and inputs of a standard job. Same effect as `delete`, which works in both modes. */
   async deleteStandard(jobId: string): Promise<void> {
     await this.request("DELETE", `/v1/standard/videos/${encodeURIComponent(jobId)}`);
   }

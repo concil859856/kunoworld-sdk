@@ -5,7 +5,12 @@ GPU enclave whose attestation evidence it checks first; verifies the enclave-sig
 and decrypts the finished video locally. Requires Python 3.10+.
 
 > **Development preview.** Workers on development gateways use simulated attestation and may
-> return placeholder video. Real TDX and NVIDIA evidence verification is not built yet.
+> return placeholder video. Real TDX and NVIDIA evidence verification is not built yet. Prices
+> are placeholders that haven't been set (`models()` may include `"pricing_placeholder": true`).
+
+**API keys are for developers**, calling KunoWorld from programs they run; create one on your
+account page. People using the KunoWorld website sign in with their email instead, and the site
+never hands their browser a key or token.
 
 ## Install
 
@@ -47,15 +52,20 @@ Without `manifest=`, the client falls back to the manifest the gateway serves an
 
 ## Private or Standard
 
-Every job has a privacy mode, set with `privacy=`:
+Every job has a privacy mode, set with `privacy=`. In both modes the video is stored on
+KunoWorld's object storage (Cloudflare R2) **until you delete it**; nothing expires on its own.
 
 - `"private"` (the default) is everything above: encrypted on your machine to an attested
   confidential enclave, and opened only with the job's output key. Nobody at KunoWorld can read
-  it. Private jobs only ever run on confidential-tier miners.
+  it, and nobody can recover a lost key: a lost key means a lost video. Private jobs only ever run
+  on confidential-tier miners.
 - `"standard"` sends the prompt and inputs to KunoWorld readable. **KunoWorld and the GPU provider
   can see the video and your prompt.** There is no client-side encryption and no key to keep; the
-  job can run on any miner, and KunoWorld keeps the video, prompt and inputs (30 days by default)
-  so your API key can fetch them again.
+  job can run on any miner, and only your account's credentials can fetch the video again.
+
+KunoWorld operators can open a video only when it is reported as child sexual abuse material (or
+sexual content involving a minor) or is under a legal hold, and every such view is logged. There
+is no sampled review. All NSFW content is banned in both modes.
 
 ```python
 result = kuno.generate("A paper boat crosses a rain puddle", model="ltx-2.5-fast", privacy="standard")
@@ -66,8 +76,13 @@ for row in kuno.standard_videos():          # this account's standard jobs, newe
     print(row["job_id"], row["status"])
 job = kuno.standard_job(row["job_id"])
 open("poster.jpg", "wb").write(job.thumbnail())
-job.delete()                                # deletes the stored video, prompt and inputs
+
+kuno.delete(row["job_id"])                  # either mode: deletes the stored content for good
 ```
+
+`kuno.delete(job_id)` (or `job.delete()` on a `VideoJob` or `StandardVideoJob`) removes a private
+job's sealed files, or a standard job's video, prompt, inputs and preview. The charge record and
+the receipt stay.
 
 With `wait=False`, a standard `generate` returns a `StandardVideoJob` (`status`, `wait`, `result`,
 `cancel`, `thumbnail`, `delete`, `export`). Its export holds no secrets. Every `JobStatus` carries
@@ -87,13 +102,20 @@ operator credit, no active restriction and fewer than 2 blocked jobs in 30 days.
 | `upload_blocked` (422) | a standard upload matched the content scan |
 | `scan_unavailable` (503) | the upload scanner couldn't be reached; nothing was charged, try again |
 | `unsupported_media` (422) | the gateway didn't recognize an upload's type (it reads the bytes, not the content-type) |
+| `content_policy` (422) | a standard job breaks the content policy (all NSFW is banned); not created, nothing charged |
 | `safety_blocked` | the in-enclave content check stopped the job; it counts as a strike |
 | `bad_output` | the video didn't match its receipt, so the job failed and was refunded |
-| `expired` / `deleted` / `removed` (410) | a standard video or thumbnail is past retention, was deleted, or was removed after review |
+| `deleted` / `removed` (410) | the video was deleted by its owner, or removed after review |
+| `key_not_accepted` (422) | a report carried an `output_key` but its reason isn't `csam` or `sexual_minor` |
+| `content_not_reviewable` (403) | operator API: the item can't be opened (not a CSAM/sexual-minor report, no matching legal hold) |
+| `gone` (410) | a retired endpoint or credential, such as a `kwt_` studio token |
+
+`ERROR_CODES` maps these codes to a sentence; `err.explanation` reads it, and
+`err.is_content_policy` is true for `content_policy` and `safety_blocked`.
 
 The rest of an error body is on `err.details`. An indefinite restriction (until an operator
 reviews the account) has `restricted_until` 253402300799, in year 9999; it is never `None` while
-an account is restricted. Rows from `standard_videos()` also carry `expires_at` and `deleted`.
+an account is restricted. Rows from `standard_videos()` also carry `deleted`.
 
 ### Reporting a video
 
@@ -103,8 +125,10 @@ report_id = kuno.report("copyright", content_digest=sha256, details="This is my 
 
 Reports are sent without your API key. The reason is one of `csam`, `sexual_minor`,
 `nonconsensual_intimate`, `violent_extremism`, `harassment`, `copyright` or `other`; identify the
-video with `content_digest`, `job_id` or `url`. Pass `output_key` only for a private video you were
-given with its key and want reviewed: it opens that one video.
+video with `content_digest`, `job_id` or `url`. `output_key` is accepted only for `csam` and
+`sexual_minor` reports (the client refuses others with `key_not_accepted` before sending), for a
+private video you were given with its key: it lets a reviewer open that one video, and the view is
+logged.
 
 ## Inputs and modes
 
@@ -167,6 +191,7 @@ when you are done.
 | `generate(prompt, ..., privacy="private")` | private: route, verify, encrypt, submit; standard: upload, create. Waits by default |
 | `prepare(...)` / `submit(prepared)` | the private path, in two steps |
 | `submit_standard(prompt, ...)` / `upload_standard(role, data, mime)` | the standard path, in pieces |
+| `delete(job_id)` | delete a job's stored content, in either mode |
 | `standard_videos(limit=50)` / `standard_job(job_id)` | your standard jobs, and a handle on one |
 | `eligibility()` | private-mode eligibility, restriction and strike counts |
 | `report(reason, ...)` | report a video (no credential sent) |
