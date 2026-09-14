@@ -88,6 +88,12 @@ export interface SwitchConfig {
   disabled_profiles: string[];
   h3_authorized_everywhere: boolean;
   emission_split: Record<string, number>;
+  /** Capacity pay: share of serving miner emission paid for ready, attested GPUs (0 pays none). */
+  capacity_share?: number;
+  /** Capacity pay: family -> GPUs the network wants paid. */
+  capacity_targets?: Record<string, number>;
+  /** Capacity pay: continuous verified uptime before a GPU's run counts. */
+  capacity_min_uptime_s?: number;
 }
 
 export interface ModelsResponse {
@@ -198,7 +204,14 @@ export interface AllowedMeasurement {
   rtmr1: string;
   rtmr2: string;
   rtmr3: string;
+  // Absent on entries signed before GPU modes: then any mode and count pass, as before.
+  gpu_mode?: GpuCcMode | null;
+  gpus_per_enclave?: number | null;
+  nvswitches_per_enclave?: number | null;
 }
+
+/** NVIDIA confidential-computing mode: one GPU per VM, Hopper Protected PCIe, or Blackwell multi-GPU. */
+export type GpuCcMode = "spt" | "ppcie" | "mpt";
 
 export interface GoldenManifest {
   version: number;

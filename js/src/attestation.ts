@@ -126,10 +126,42 @@ export function verifyEvidence(
         MEASUREMENT_KEYS.every((k) => verdict.measurements[k] === a[k]),
     );
     if (!allowed) reasons.push("measurements are not in the golden manifest");
-    else if (!evidence.profiles.every((p) => allowed.profiles.includes(p))) reasons.push("image is not approved for all claimed profiles");
+    else {
+      if (!evidence.profiles.every((p) => allowed.profiles.includes(p))) reasons.push("image is not approved for all claimed profiles");
+      reasons.push(...gpuEntryProblems(allowed, gpu));
+    }
   }
   verdict.ok = reasons.length === 0;
   return verdict;
+}
+
+/**
+ * The manifest entry's GPU mode and counts against what the GPU evidence declares (kuno_protocol.attestation does the
+ * same with the counts NVIDIA's verifier attested). The declaration is bound by REPORTDATA; this SDK doesn't verify
+ * NVIDIA's signatures itself. Entries signed before these fields accept any mode and count.
+ */
+function gpuEntryProblems(entry: GoldenManifest["allowed"][number], gpu: Uint8Array | null): string[] {
+  if (entry.gpu_mode == null && entry.gpus_per_enclave == null && entry.nvswitches_per_enclave == null) return [];
+  let doc: { gpus?: unknown[]; switches?: unknown[]; cc?: { mode?: string; devtools?: boolean } };
+  try {
+    doc = gpu ? (JSON.parse(new TextDecoder().decode(gpu)) as typeof doc) : {};
+  } catch {
+    return ["GPU evidence is malformed"];
+  }
+  const problems: string[] = [];
+  if (doc.cc?.devtools) problems.push("the GPUs are in CC devtools mode");
+  if (entry.gpu_mode != null && doc.cc?.mode !== entry.gpu_mode) {
+    problems.push(`the GPU evidence declares ${doc.cc?.mode ?? "no GPU mode"}, but the manifest entry requires ${entry.gpu_mode}`);
+  }
+  const gpus = Array.isArray(doc.gpus) ? doc.gpus.length : 0;
+  if (entry.gpus_per_enclave != null && gpus !== entry.gpus_per_enclave) {
+    problems.push(`the evidence carries ${gpus} GPU(s), but the manifest entry requires ${entry.gpus_per_enclave} per enclave`);
+  }
+  const switches = Array.isArray(doc.switches) ? doc.switches.length : 0;
+  if (entry.nvswitches_per_enclave != null && switches !== entry.nvswitches_per_enclave) {
+    problems.push(`the evidence carries ${switches} NVSwitch(es), but the manifest entry requires ${entry.nvswitches_per_enclave} per enclave`);
+  }
+  return problems;
 }
 
 function safeVerify(signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array): boolean {
