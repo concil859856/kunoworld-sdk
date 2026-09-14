@@ -1,5 +1,5 @@
 import { verifyEvidence, verifySignature } from "./attestation.js";
-import { decryptBlob, encryptBlob, openSenderSession, sha256Hex } from "./crypto.js";
+import { decryptBlob, encryptBlob, openSenderSession, padPayload, sha256Hex } from "./crypto.js";
 import { b64d, b64e, canonicalJson, concatBytes, utf8 } from "./encoding.js";
 import type {
   EnclaveInfo,
@@ -17,7 +17,9 @@ import type {
   Provenance,
   Receipt,
   ReportRequest,
+  RouteFit,
   RouteResponse,
+  ServingEnvelope,
   SharedVideo,
   SharedVideoDetails,
   ShareLink,
@@ -263,6 +265,25 @@ export function priceUsd(
   privacy: PrivacyMode = "private",
 ): number | null {
   return priceQuote(profile, params, privacy)?.usd ?? null;
+}
+
+/**
+ * Whether a job fits a worker's serving envelope (kuno_protocol.envelope): `duration_s` at most the longest the worker
+ * serves at the job's resolution, aspect ratio and fps. No envelope, or none for the profile, means the profile's limits.
+ */
+export function envelopeFits(
+  envelope: ServingEnvelope | null | undefined,
+  params: Pick<GenerationParams, "profile_id" | "resolution" | "aspect_ratio" | "fps" | "duration_s">,
+): boolean {
+  const table = envelope?.[params.profile_id];
+  if (!table) return true;
+  const longest = table[params.resolution]?.[params.aspect_ratio]?.[String(params.fps)];
+  return typeof longest === "number" && params.duration_s <= longest + 1e-6;
+}
+
+/** The fields `/v1/route` filters workers by, as the caller gave them: the defaults depend on the profile the route picks. */
+function routeFit(req: Pick<GenerateRequest, "resolution" | "aspectRatio" | "fps" | "durationS">): RouteFit {
+  return { resolution: req.resolution, aspectRatio: req.aspectRatio, fps: req.fps, durationS: req.durationS };
 }
 
 /** Same rules as the Python SDK: defaults from the profile; adapt after a fallback. */
@@ -520,12 +541,18 @@ export class KunoClient {
   /**
    * Which profile and enclaves would serve a request. The credential is sent when the client has
    * one, so the gateway can refuse private routing to an account that isn't eligible for it.
+   * `fit` (resolution, aspect ratio, fps, duration) keeps only workers whose hardware can fit such a
+   * request (their serving envelope); an omitted field matches any value.
    */
-  async route(mode: Mode, model?: string, family?: string, privacy?: PrivacyMode): Promise<RouteResponse> {
+  async route(mode: Mode, model?: string, family?: string, privacy?: PrivacyMode, fit?: RouteFit): Promise<RouteResponse> {
     const q = new URLSearchParams({ mode });
     if (model) q.set("profile_id", model);
     if (family) q.set("family", family);
     if (privacy === "standard") q.set("privacy", "standard");
+    if (fit?.resolution !== undefined) q.set("resolution", fit.resolution);
+    if (fit?.aspectRatio !== undefined) q.set("aspect_ratio", fit.aspectRatio);
+    if (fit?.fps !== undefined) q.set("fps", String(fit.fps));
+    if (fit?.durationS !== undefined) q.set("duration_s", String(fit.durationS));
     return this.json<RouteResponse>("GET", `/v1/route?${q}`);
   }
 
@@ -551,7 +578,7 @@ export class KunoClient {
     const mode = req.mode ?? inferMode(roles);
 
     onStage?.("routing");
-    const route = await this.route(mode, req.model, req.family, "standard");
+    const route = await this.route(mode, req.model, req.family, "standard", routeFit(req));
     const profile = (await this.models(0)).models.find((m) => m.id === route.profile_id);
     if (!profile) throw new KunoError(404, "unknown_model", `Unknown model ${route.profile_id}.`);
     const params = fitParams(profile, mode, roles, req, route.fallback_reason);
@@ -614,13 +641,13 @@ export class KunoClient {
     const mode = req.mode ?? inferMode(roles);
 
     onStage?.("routing");
-    const route = await this.route(mode, req.model, req.family);
+    const route = await this.route(mode, req.model, req.family, undefined, routeFit(req));
     const profile = (await this.models(0)).models.find((m) => m.id === route.profile_id);
     if (!profile) throw new KunoError(404, "unknown_model", `Unknown model ${route.profile_id}.`);
     const params = fitParams(profile, mode, roles, req, route.fallback_reason);
 
     onStage?.("verifying");
-    const enclave = await this.pickEnclave(route);
+    const enclave = await this.pickEnclave(route, params);
 
     onStage?.("encrypting");
     const jobId = crypto.randomUUID();
@@ -656,7 +683,15 @@ export class KunoClient {
       inputs: refs,
       options: req.options ?? {},
     };
-    const ciphertext = await session.seal(utf8(JSON.stringify(payload)), jobAad(jobId, enclave.enclave_id, params, blobIds));
+    // Padded to a power-of-two bucket, so the request's size doesn't give away the prompt's length.
+    let plaintext: Uint8Array;
+    try {
+      plaintext = padPayload(utf8(JSON.stringify(payload)));
+    } catch (err) {
+      if (err instanceof RangeError) throw new KunoError(0, "request_too_large", `The request is too large to seal: ${err.message}.`);
+      throw err;
+    }
+    const ciphertext = await session.seal(plaintext, jobAad(jobId, enclave.enclave_id, params, blobIds));
 
     onStage?.("submitting");
     await this.json("POST", "/v1/videos", {
@@ -678,9 +713,15 @@ export class KunoClient {
     };
   }
 
-  private async pickEnclave(route: RouteResponse): Promise<EnclaveInfo> {
+  private async pickEnclave(route: RouteResponse, params?: GenerationParams): Promise<EnclaveInfo> {
     const manifest = await this.manifest();
+    let tooSmall = false;
     for (const enclave of route.enclaves) {
+      // The route was filtered by the fields the caller gave; defaults filled in since may not fit every worker listed.
+      if (params && !envelopeFits(enclave.envelope, params)) {
+        tooSmall = true;
+        continue;
+      }
       const verdict = verifyEvidence(enclave.evidence, manifest);
       if (
         verdict.ok &&
@@ -692,6 +733,7 @@ export class KunoClient {
         return enclave;
       }
     }
+    if (tooSmall) throw new KunoError(503, "no_capacity", "No worker listed can fit this video's size, frame rate and duration right now.");
     throw new KunoError(503, "no_attested_worker", "No worker with valid attestation is available for this model right now.");
   }
 

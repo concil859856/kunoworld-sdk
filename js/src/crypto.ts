@@ -11,6 +11,10 @@
  *   version 2 (written by default): the chunks carry length:u64be | plaintext | zeros, padded to
  *   padme(8 + length) bytes (PADMÉ, Nikitin et al., PoPETs 2019, arXiv:1806.03160), so a blob's
  *   size reveals only its size bucket. Both versions decrypt.
+ *
+ * Sealed requests (the HPKE plaintext, see kuno_protocol.sealed_payload): senders write
+ * 0x02 | length:u32be | JSON | zeros, padded to a power of two from 4 KiB to 256 KiB, so a request's
+ * size doesn't give away the prompt's length. Bare JSON (form 1) is what clients sealed before padding.
  */
 
 import { CipherSuite, DhkemX25519HkdfSha256, HkdfSha256 } from "@hpke/core";
@@ -75,6 +79,67 @@ export async function openSenderSession(enclavePublicKey: Uint8Array): Promise<S
       return new Uint8Array(await ctx.seal(plaintext, aad));
     },
   };
+}
+
+/** Sealed request form 1: bare JSON. Still opened by workers, no longer written. */
+export const PAYLOAD_V1 = 1;
+/** Sealed request form 2: 0x02 | length:u32be | JSON | zeros, padded to a power-of-two bucket. */
+export const PAYLOAD_V2 = 2;
+const PAYLOAD_HEADER_LEN = 5;
+/** The smallest padded request, so short prompts all look alike. */
+export const PAYLOAD_MIN_PADDED = 4 * 1024;
+/** The largest padded request; longer JSON is refused before sealing. */
+export const PAYLOAD_MAX_PADDED = 256 * 1024;
+// What a JSON object may start with: the brace or JSON whitespace. 0x02 never does.
+const JSON_START = new Set([0x7b, 0x20, 0x09, 0x0a, 0x0d]);
+
+function payloadBucket(framedLength: number): number {
+  let size = PAYLOAD_MIN_PADDED;
+  while (size < framedLength) size *= 2;
+  return size;
+}
+
+/** Length of the padded plaintext for a request of this many bytes of JSON. Throws RangeError above the limit. */
+export function paddedPayloadLength(jsonLength: number): number {
+  if (!Number.isSafeInteger(jsonLength) || jsonLength < 0) throw new RangeError("length must be a non-negative safe integer");
+  const limit = PAYLOAD_MAX_PADDED - PAYLOAD_HEADER_LEN;
+  if (jsonLength > limit) throw new RangeError(`a sealed request is limited to ${limit} bytes of JSON`);
+  return payloadBucket(PAYLOAD_HEADER_LEN + jsonLength);
+}
+
+/** The padded plaintext for a request's JSON: what a sender passes to `SenderSession.seal`. */
+export function padPayload(json: Uint8Array): Uint8Array {
+  const out = new Uint8Array(paddedPayloadLength(json.length)); // zero-filled
+  out[0] = PAYLOAD_V2;
+  new DataView(out.buffer).setUint32(1, json.length, false);
+  out.set(json, PAYLOAD_HEADER_LEN);
+  return out;
+}
+
+/** The form a decrypted request is in (PAYLOAD_V1 or PAYLOAD_V2), or null if it is neither. */
+export function payloadVersion(plaintext: Uint8Array): number | null {
+  if (plaintext.length === 0) return null;
+  if (plaintext[0] === PAYLOAD_V2) return PAYLOAD_V2;
+  return JSON_START.has(plaintext[0]) ? PAYLOAD_V1 : null;
+}
+
+/**
+ * The JSON inside a decrypted request of either form. Throws DecryptionError on unknown framing, a length that
+ * doesn't fit, a plaintext that isn't exactly its bucket, or non-zero padding.
+ */
+export function unpadPayload(plaintext: Uint8Array): Uint8Array {
+  const version = payloadVersion(plaintext);
+  if (version === PAYLOAD_V1) return plaintext;
+  if (version === null) throw new DecryptionError("the sealed request has an unknown framing");
+  if (plaintext.length < PAYLOAD_HEADER_LEN) throw new DecryptionError("the padded request is too short to hold its length");
+  if (plaintext.length > PAYLOAD_MAX_PADDED) throw new DecryptionError("the padded request is larger than the maximum padded size");
+  const end = PAYLOAD_HEADER_LEN + new DataView(plaintext.buffer, plaintext.byteOffset, plaintext.byteLength).getUint32(1, false);
+  if (end > plaintext.length) throw new DecryptionError("the padded request declares more JSON than it holds");
+  if (payloadBucket(end) !== plaintext.length) throw new DecryptionError("the padded request is not padded to its size bucket");
+  for (let i = end; i < plaintext.length; i++) {
+    if (plaintext[i] !== 0) throw new DecryptionError("the padded request has non-zero padding");
+  }
+  return plaintext.slice(PAYLOAD_HEADER_LEN, end);
 }
 
 /**

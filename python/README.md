@@ -258,7 +258,7 @@ when you are done.
 |---|---|
 | `models()` / `profile(profile_id)` | model profiles, availability and the switch |
 | `manifest()` | the golden manifest in use |
-| `route(mode, model=None, family=None, privacy="private")` | which profile and enclaves would serve a request |
+| `route(mode, model=None, family=None, privacy="private", *, resolution=None, aspect_ratio=None, fps=None, duration_s=None)` | which profile and enclaves would serve a request; the size, frame rate and duration list only workers whose hardware can fit them (their serving envelope). `generate`, `prepare` and `submit_standard` send the request's own |
 | `generate(prompt, ..., privacy="private")` | private: route, verify, encrypt, submit; standard: upload, create. Waits by default |
 | `prepare(...)` / `submit(prepared)` | the private path, in two steps |
 | `submit_standard(prompt, ...)` / `upload_standard(role, data, mime)` | the standard path, in pieces |

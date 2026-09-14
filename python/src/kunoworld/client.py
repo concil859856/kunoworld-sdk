@@ -17,6 +17,7 @@ from kuno_protocol.attestation import AttestationEvidence, GoldenManifest, verif
 from kuno_protocol.blobs import decrypt_blob, encrypt_blob
 from kuno_protocol.canonical import b64d, b64e, sha256_hex
 from kuno_protocol.crypto import DecryptionError, SenderSession
+from kuno_protocol.envelope import fits as envelope_fits
 from kuno_protocol.media import sniff_mime
 from kuno_protocol.profiles import InputRole, Mode, ModelProfile
 from kuno_protocol.receipts import Receipt, verify_receipt
@@ -32,6 +33,7 @@ from kuno_protocol.schemas import (
     job_aad,
     output_label,
 )
+from kuno_protocol.sealed_payload import PayloadTooLarge, seal_payload
 
 Source = Union[str, Path, bytes]
 ProgressFn = Callable[[JobStatus], None]
@@ -252,15 +254,29 @@ class KunoClient:
         return self.provenance_by_digest(sha256_hex(data))
 
     def route(
-        self, mode: Mode, model: str | None = None, family: str | None = None, privacy: Privacy = "private"
+        self,
+        mode: Mode,
+        model: str | None = None,
+        family: str | None = None,
+        privacy: Privacy = "private",
+        *,
+        resolution: str | None = None,
+        aspect_ratio: str | None = None,
+        fps: int | None = None,
+        duration_s: float | None = None,
     ) -> RouteResponse:
-        params = {"mode": mode.value}
+        """Which profile and enclaves would serve a request. `resolution`, `aspect_ratio`, `fps` and `duration_s` keep only
+        workers whose hardware can fit such a request (their serving envelope); an omitted one matches any value."""
+        params: dict[str, Any] = {"mode": mode.value}
         if model:
             params["profile_id"] = model
         if family:
             params["family"] = family
         if privacy == "standard":
             params["privacy"] = "standard"
+        for key, value in (("resolution", resolution), ("aspect_ratio", aspect_ratio), ("fps", fps), ("duration_s", duration_s)):
+            if value is not None:
+                params[key] = value
         return RouteResponse.model_validate(self._request("GET", "/v1/route", params=params).json())
 
     # ------------------------------------------------------------ account safety
@@ -440,10 +456,11 @@ class KunoClient:
         """Routes, verifies the enclave, encrypts and uploads inputs, and seals the request."""
         inputs = inputs or []
         mode = mode or infer_mode(i.role for i in inputs)
-        route = self.route(mode, model, family)
+        # Only workers whose hardware can fit what was asked for (their serving envelope).
+        route = self.route(mode, model, family, resolution=resolution, aspect_ratio=aspect_ratio, fps=fps, duration_s=duration_s)
         profile = self.profile(route.profile_id)
         params = _fit_params(profile, mode, inputs, duration_s, resolution, aspect_ratio, fps, audio, route.fallback_reason)
-        enclave = self._pick_enclave(route)
+        enclave = self._pick_enclave(self._fitting_route(route, params))
 
         job_id = str(uuid.uuid4())
         session = SenderSession(b64d(enclave["hpke_public_key"]))
@@ -467,9 +484,11 @@ class KunoClient:
                 )
             )
         payload = SealedPayload(prompt=prompt, negative_prompt=negative_prompt, seed=seed, inputs=refs, options=options or {})
-        ciphertext = session.seal(
-            payload.model_dump_json().encode(), job_aad(job_id, enclave["enclave_id"], params, blob_ids)
-        )
+        try:
+            # Padded to a power-of-two bucket, so the request's size doesn't give away the prompt's length.
+            ciphertext = seal_payload(session, payload, job_aad(job_id, enclave["enclave_id"], params, blob_ids))
+        except PayloadTooLarge as exc:
+            raise KunoError(0, "request_too_large", f"The request is too large to seal: {exc}.") from None
         request = JobCreate(
             job_id=job_id,
             params=params,
@@ -507,7 +526,9 @@ class KunoClient:
         """Standard mode: uploads the inputs as they are and lets the gateway seal the job to a miner."""
         inputs = inputs or []
         mode = mode or infer_mode(i.role for i in inputs)
-        route = self.route(mode, model, family, privacy="standard")
+        route = self.route(
+            mode, model, family, privacy="standard", resolution=resolution, aspect_ratio=aspect_ratio, fps=fps, duration_s=duration_s
+        )
         profile = self.profile(route.profile_id)
         params = _fit_params(profile, mode, inputs, duration_s, resolution, aspect_ratio, fps, audio, route.fallback_reason)
         refs = []
@@ -542,6 +563,21 @@ class KunoClient:
             prepared.request.params.profile_id,
             prepared.fallback_reason,
         )
+
+    @staticmethod
+    def _fitting_route(route: RouteResponse, params: GenerationParams) -> RouteResponse:
+        """The route with only the enclaves whose serving envelope fits the filled-in params. The gateway filtered it by
+        the fields the caller gave; defaults filled in since may not fit every worker listed."""
+        fitting = [e for e in route.enclaves if envelope_fits((e.get("envelope") or {}).get(route.profile_id), params)]
+        if len(fitting) == len(route.enclaves):
+            return route
+        if not fitting:
+            raise KunoError(503, "no_capacity", "No worker listed can fit this video's size, frame rate and duration right now.")
+        import copy
+
+        narrowed = copy.copy(route)
+        narrowed.enclaves = fitting
+        return narrowed
 
     def _pick_enclave(self, route: RouteResponse) -> dict:
         manifest = self.manifest()

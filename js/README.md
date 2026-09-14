@@ -262,7 +262,7 @@ A `kwt_` studio token is refused with `gone`.
 |---|---|
 | `models(maxAgeMs = 15000)` | model profiles, availability and the switch; cached for 15 s |
 | `manifest()` | the golden manifest the gateway serves |
-| `route(mode, model?, family?, privacy?)` | which profile and enclaves would serve a request |
+| `route(mode, model?, family?, privacy?, fit?)` | which profile and enclaves would serve a request; `fit` (`resolution`, `aspectRatio`, `fps`, `durationS`) lists only workers whose hardware can fit it (their serving envelope). `submit` sends the request's own fields |
 | `submit(request, onStage?)` | private: route, verify evidence, encrypt, upload; returns a `JobHandle`. Standard (`privacy: "standard"`): upload inputs, create; returns a `StandardJobHandle`. `onStage` reports `routing`, `verifying`, `encrypting`, `uploading`, `submitting` |
 | `generate(request, { onStage, ...waitOptions })` | `submit` then `wait` |
 | `wait(handle, { onProgress, signal, pollMs, timeoutMs })` | poll to completion, then fetch the video (verified and decrypted for private jobs) |

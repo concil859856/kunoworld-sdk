@@ -278,6 +278,21 @@ export interface EnclaveInfo {
   status: string;
   verified_at: number;
   last_seen: number;
+  /** What the worker's hardware can fit, for the profiles it can't serve in full; null or absent: full limits. */
+  envelope?: ServingEnvelope | null;
+}
+
+/** resolution -> aspect ratio -> fps -> the longest duration_s served. A size or frame rate left out is not served. */
+export type EnvelopeTable = Record<string, Record<string, Record<string, number>>>;
+/** profile id -> its table (kuno_protocol.envelope). A profile left out serves its full limits. */
+export type ServingEnvelope = Record<string, EnvelopeTable>;
+
+/** Optional request fields `/v1/route` filters workers by. */
+export interface RouteFit {
+  resolution?: string;
+  aspectRatio?: string;
+  fps?: number;
+  durationS?: number;
 }
 
 export interface RouteResponse {
