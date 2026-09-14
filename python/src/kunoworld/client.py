@@ -5,7 +5,7 @@ import uuid
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Union
+from typing import Any, Callable, Iterable, Literal, Union
 
 import httpx
 
@@ -31,12 +31,31 @@ from kuno_protocol.schemas import (
 
 Source = Union[str, Path, bytes]
 ProgressFn = Callable[[JobStatus], None]
+Privacy = Literal["private", "standard"]
+
+REPORT_REASONS = ("csam", "sexual_minor", "nonconsensual_intimate", "violent_extremism", "harassment", "copyright", "other")
 
 
 class KunoError(Exception):
-    def __init__(self, status: int, code: str, message: str):
+    """A failed request. `details` is the rest of the gateway's error body, such as `reasons` on
+    `private_mode_not_eligible` or `restricted_until` on `account_restricted`."""
+
+    def __init__(self, status: int, code: str, message: str, details: dict[str, Any] | None = None):
         super().__init__(f"{code}: {message}")
         self.status, self.code, self.message = status, code, message
+        self.details: dict[str, Any] = details or {}
+
+    @property
+    def reasons(self) -> list[str]:
+        """Why private mode isn't available (`private_mode_not_eligible`)."""
+        reasons = self.details.get("reasons")
+        return [r for r in reasons if isinstance(r, str)] if isinstance(reasons, list) else []
+
+    @property
+    def restricted_until(self) -> float | None:
+        """Unix seconds until which the account is restricted (`account_restricted`)."""
+        until = self.details.get("restricted_until")
+        return float(until) if isinstance(until, (int, float)) else None
 
 
 @dataclass
@@ -85,6 +104,7 @@ class GenerationResult:
     receipt: Receipt
     profile_id: str
     fallback_reason: str | None = None
+    privacy: Privacy = "private"
 
     @property
     def content_digest(self) -> str:
@@ -136,16 +156,22 @@ class KunoClient:
     def __exit__(self, *exc) -> None:
         self.close()
 
-    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        response = self._http.request(method, path, **kwargs)
+    def _request(self, method: str, path: str, *, auth: bool = True, **kwargs) -> httpx.Response:
+        request = self._http.build_request(method, path, **kwargs)
+        if not auth:
+            request.headers.pop("authorization", None)
+        response = self._http.send(request)
         if response.status_code >= 400:
             try:
                 detail = response.json().get("detail", {})
-            except ValueError:
+            except (ValueError, AttributeError):
                 detail = {}
             if not isinstance(detail, dict):
                 detail = {"message": str(detail)}
-            raise KunoError(response.status_code, detail.get("code", "error"), detail.get("message", response.text[:200]))
+            rest = {k: v for k, v in detail.items() if k not in ("code", "message")}
+            raise KunoError(
+                response.status_code, detail.get("code", "error"), detail.get("message", response.text[:200]), rest
+            )
         return response
 
     # ------------------------------------------------------------ discovery
@@ -176,13 +202,72 @@ class KunoClient:
         data = video if isinstance(video, bytes) else Path(video).read_bytes()
         return self.provenance_by_digest(sha256_hex(data))
 
-    def route(self, mode: Mode, model: str | None = None, family: str | None = None) -> RouteResponse:
+    def route(
+        self, mode: Mode, model: str | None = None, family: str | None = None, privacy: Privacy = "private"
+    ) -> RouteResponse:
         params = {"mode": mode.value}
         if model:
             params["profile_id"] = model
         if family:
             params["family"] = family
+        if privacy == "standard":
+            params["privacy"] = "standard"
         return RouteResponse.model_validate(self._request("GET", "/v1/route", params=params).json())
+
+    # ------------------------------------------------------------ account safety
+
+    def eligibility(self) -> dict:
+        """Whether this account may make private jobs: `{private_mode: {eligible, reasons},
+        restricted_until, strikes_24h, strikes_7d}`."""
+        return self._request("GET", "/v1/account/eligibility").json()
+
+    def report(
+        self,
+        reason: str,
+        *,
+        content_digest: str | None = None,
+        job_id: str | None = None,
+        url: str | None = None,
+        details: str | None = None,
+        output_key: str | None = None,
+        contact_email: str | None = None,
+    ) -> str:
+        """Reports a video, identified by at least one of `content_digest`, `job_id` or `url`.
+        No credential is sent. Returns the report id.
+
+        `output_key` (base64url) is the key of a private video you received; include it only if you
+        want KunoWorld to be able to review that one video."""
+        if reason not in REPORT_REASONS:
+            raise KunoError(0, "invalid_reason", f"reason must be one of {', '.join(REPORT_REASONS)}.")
+        if not (content_digest or job_id or url):
+            raise KunoError(0, "invalid_report", "Identify the video by content_digest, job_id or url.")
+        fields = {
+            "content_digest": content_digest,
+            "job_id": job_id,
+            "url": url,
+            "reason": reason,
+            "details": details,
+            "output_key": output_key,
+            "contact_email": contact_email,
+        }
+        body = {k: v for k, v in fields.items() if v is not None}
+        return self._request("POST", "/v1/reports", json=body, auth=False).json()["report_id"]
+
+    # ------------------------------------------------------------ standard library
+
+    def standard_videos(self, limit: int = 50) -> list[dict]:
+        """This account's standard jobs, newest first."""
+        return self._request("GET", "/v1/standard/videos", params={"limit": limit}).json()
+
+    def standard_job(self, job_id: str, profile_id: str = "") -> StandardVideoJob:
+        """A handle on an existing standard job, to wait on, download or delete it."""
+        return StandardVideoJob(self, job_id, profile_id)
+
+    def upload_standard(self, role: InputRole, data: bytes, mime: str) -> dict:
+        """Uploads one standard-mode input as it is. Uploads are scanned: a match is `upload_blocked`."""
+        return self._request(
+            "POST", "/v1/standard/uploads", params={"role": role.value}, content=data, headers={"content-type": mime}
+        ).json()
 
     # ------------------------------------------------------------ generation
 
@@ -209,10 +294,16 @@ class KunoClient:
         source_video: Source | None = None,
         source_audio: Source | None = None,
         options: dict[str, Any] | None = None,
+        privacy: Privacy = "private",
         wait: bool = True,
         timeout: float = 1800.0,
         on_progress: ProgressFn | None = None,
-    ) -> GenerationResult | VideoJob:
+    ) -> GenerationResult | VideoJob | StandardVideoJob:
+        """`privacy="private"` (default) encrypts on this machine to an attested confidential enclave.
+        `privacy="standard"` sends the prompt and inputs to KunoWorld readable: KunoWorld and the
+        GPU provider can see them and the video; there is no client-side encryption."""
+        if privacy not in ("private", "standard"):
+            raise KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".')
         inputs: list[Input] = []
         if first_frame is not None:
             inputs.append(Input.load(InputRole.FIRST_FRAME, first_frame))
@@ -226,6 +317,24 @@ class KunoClient:
             inputs.append(Input.load(InputRole.SOURCE_VIDEO, source_video))
         if source_audio is not None:
             inputs.append(Input.load(InputRole.SOURCE_AUDIO, source_audio))
+
+        if privacy == "standard":
+            standard = self.submit_standard(
+                prompt,
+                inputs=inputs,
+                model=model,
+                family=family,
+                mode=Mode(mode) if mode else None,
+                duration_s=duration_s,
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
+                fps=fps,
+                audio=audio,
+                seed=seed,
+                negative_prompt=negative_prompt,
+                options=options,
+            )
+            return standard.wait(timeout=timeout, on_progress=on_progress) if wait else standard
 
         prepared = self.prepare(
             prompt,
@@ -311,6 +420,52 @@ class KunoClient:
             input_blob_bytes=blob_bytes,
         )
 
+    def submit_standard(
+        self,
+        prompt: str,
+        *,
+        inputs: list[Input] | None = None,
+        model: str | None = None,
+        family: str | None = None,
+        mode: Mode | None = None,
+        duration_s: float | None = None,
+        resolution: str | None = None,
+        aspect_ratio: str | None = None,
+        fps: int | None = None,
+        audio: bool = True,
+        seed: int | None = None,
+        negative_prompt: str | None = None,
+        options: dict[str, Any] | None = None,
+        webhook_url: str | None = None,
+    ) -> StandardVideoJob:
+        """Standard mode: uploads the inputs as they are and lets the gateway seal the job to a miner."""
+        inputs = inputs or []
+        mode = mode or infer_mode(i.role for i in inputs)
+        route = self.route(mode, model, family, privacy="standard")
+        profile = self.profile(route.profile_id)
+        params = _fit_params(profile, mode, inputs, duration_s, resolution, aspect_ratio, fps, audio, route.fallback_reason)
+        refs = []
+        for index, item in enumerate(inputs):
+            upload = self.upload_standard(item.role, item.data, item.mime)
+            ref: dict[str, Any] = {"upload_id": upload["upload_id"], "index": index, "role": item.role.value}
+            for key in ("time_s", "strength", "hint", "start_s", "end_s"):
+                if getattr(item, key) is not None:
+                    ref[key] = getattr(item, key)
+            refs.append(ref)
+        body: dict[str, Any] = {
+            "job_id": str(uuid.uuid4()),
+            "params": params.model_dump(mode="json"),
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "seed": seed,
+            "options": options or {},
+            "inputs": refs,
+        }
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        status = JobStatus.model_validate(self._request("POST", "/v1/standard/videos", json=body).json())
+        return StandardVideoJob(self, status.job_id, status.params.profile_id, route.fallback_reason)
+
     def submit(self, prepared: PreparedJob) -> VideoJob:
         self._request("POST", "/v1/videos", json=prepared.request.model_dump(mode="json"))
         return VideoJob(
@@ -383,19 +538,7 @@ class VideoJob:
         return JobStatus.model_validate(self.client._request("POST", f"/v1/videos/{self.job_id}/cancel").json())
 
     def wait(self, timeout: float = 1800.0, poll_s: float = 1.0, on_progress: ProgressFn | None = None) -> GenerationResult:
-        deadline = time.time() + timeout
-        while True:
-            status = self.status()
-            if on_progress:
-                on_progress(status)
-            if status.status is JobState.SUCCEEDED:
-                return self.result(status)
-            if status.status.terminal:
-                code = status.error_code or f"job_{status.status.value}"
-                raise KunoError(0, code, status.error or "The job did not complete.")
-            if time.time() > deadline:
-                raise KunoError(0, "timeout", f"Job {self.job_id} is still {status.status.value}.")
-            time.sleep(poll_s)
+        return _wait(self, timeout, poll_s, on_progress)
 
     def result(self, status: JobStatus | None = None) -> GenerationResult:
         status = status or self.status()
@@ -411,6 +554,76 @@ class VideoJob:
         if sha256_hex(video) != receipt.body.content_digest:
             raise KunoError(0, "integrity", "The decrypted video does not match the receipt.")
         return GenerationResult(self.job_id, video, receipt, self.profile_id, self.fallback_reason)
+
+
+class StandardVideoJob:
+    """A standard job. It holds no secrets: the account's credentials fetch the video."""
+
+    privacy: Privacy = "standard"
+
+    def __init__(self, client: KunoClient, job_id: str, profile_id: str, fallback_reason: str | None = None):
+        self.client = client
+        self.job_id = job_id
+        self.profile_id = profile_id
+        self.fallback_reason = fallback_reason
+
+    def export(self) -> dict[str, str | None]:
+        return {
+            "privacy": "standard",
+            "job_id": self.job_id,
+            "profile_id": self.profile_id,
+            "fallback_reason": self.fallback_reason,
+        }
+
+    @classmethod
+    def restore(cls, client: KunoClient, data: dict) -> StandardVideoJob:
+        return cls(client, data["job_id"], data.get("profile_id", ""), data.get("fallback_reason"))
+
+    def status(self) -> JobStatus:
+        return JobStatus.model_validate(self.client._request("GET", f"/v1/videos/{self.job_id}").json())
+
+    def cancel(self) -> JobStatus:
+        return JobStatus.model_validate(self.client._request("POST", f"/v1/videos/{self.job_id}/cancel").json())
+
+    def wait(self, timeout: float = 1800.0, poll_s: float = 1.0, on_progress: ProgressFn | None = None) -> GenerationResult:
+        return _wait(self, timeout, poll_s, on_progress)
+
+    def result(self, status: JobStatus | None = None) -> GenerationResult:
+        """Downloads the stored video and checks it against the receipt's content digest."""
+        status = status or self.status()
+        if status.status is not JobState.SUCCEEDED or status.receipt is None:
+            raise KunoError(0, "not_ready", f"Job {self.job_id} is {status.status.value}.")
+        video = self.client._request("GET", f"/v1/standard/videos/{self.job_id}/video").content
+        if sha256_hex(video) != status.receipt.body.content_digest:
+            raise KunoError(0, "integrity", "The downloaded video does not match the enclave's receipt.")
+        profile_id = self.profile_id or status.params.profile_id
+        return GenerationResult(self.job_id, video, status.receipt, profile_id, self.fallback_reason, privacy="standard")
+
+    def thumbnail(self) -> bytes:
+        """A JPEG frame of the finished video."""
+        return self.client._request("GET", f"/v1/standard/videos/{self.job_id}/thumbnail").content
+
+    def delete(self) -> None:
+        """Deletes the stored video, prompt and inputs. The billing record stays."""
+        self.client._request("DELETE", f"/v1/standard/videos/{self.job_id}")
+
+
+def _wait(
+    job: VideoJob | StandardVideoJob, timeout: float, poll_s: float, on_progress: ProgressFn | None
+) -> GenerationResult:
+    deadline = time.time() + timeout
+    while True:
+        status = job.status()
+        if on_progress:
+            on_progress(status)
+        if status.status is JobState.SUCCEEDED:
+            return job.result(status)
+        if status.status.terminal:
+            code = status.error_code or f"job_{status.status.value}"
+            raise KunoError(0, code, status.error or "The job did not complete.")
+        if time.time() > deadline:
+            raise KunoError(0, "timeout", f"Job {job.job_id} is still {status.status.value}.")
+        time.sleep(poll_s)
 
 
 def _fit_params(

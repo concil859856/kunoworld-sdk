@@ -3,6 +3,7 @@ import { decryptBlob, encryptBlob, openSenderSession, sha256Hex } from "./crypto
 import { b64d, b64e, canonicalJson, concatBytes, utf8 } from "./encoding.js";
 import type {
   EnclaveInfo,
+  Eligibility,
   GenerationParams,
   GoldenManifest,
   InputRef,
@@ -11,19 +12,40 @@ import type {
   Mode,
   ModelProfile,
   ModelsResponse,
+  PrivacyMode,
   Provenance,
   Receipt,
+  ReportRequest,
   RouteResponse,
+  StandardUpload,
+  StandardVideoSummary,
 } from "./types.js";
 
+/**
+ * A failed request. `code` is the gateway's machine-readable reason. `details` holds the rest of
+ * the error body, for example `reasons` on `private_mode_not_eligible` or `restricted_until` on
+ * `account_restricted`.
+ */
 export class KunoError extends Error {
   constructor(
     public readonly status: number,
     public readonly code: string,
     message: string,
+    public readonly details: Record<string, unknown> = {},
   ) {
     super(message);
     this.name = "KunoError";
+  }
+
+  /** Why private mode isn't available (`private_mode_not_eligible`). */
+  get reasons(): string[] {
+    const r = this.details.reasons;
+    return Array.isArray(r) ? r.filter((x): x is string => typeof x === "string") : [];
+  }
+
+  /** Unix seconds until which the account is restricted (`account_restricted`), or null. */
+  get restrictedUntil(): number | null {
+    return typeof this.details.restricted_until === "number" ? this.details.restricted_until : null;
   }
 }
 
@@ -52,9 +74,15 @@ export interface GenerateRequest {
   negativePrompt?: string;
   inputs?: GenerateInput[];
   options?: Record<string, unknown>;
+  /**
+   * `private` (default): encrypted here to an attested confidential enclave; nobody at KunoWorld
+   * can read it. `standard`: sent to KunoWorld readable, so KunoWorld and the GPU provider can see
+   * the prompt, inputs and video; no client-side encryption.
+   */
+  privacy?: PrivacyMode;
 }
 
-/** Everything needed to fetch and open a video later. Store it like a password. */
+/** Everything needed to fetch and open a private video later. Store it like a password. */
 export interface JobHandle {
   jobId: string;
   outputKey: string;
@@ -63,6 +91,24 @@ export interface JobHandle {
   profileId: string;
   fallbackReason: string | null;
   createdAt: number;
+  /** Absent on handles saved before standard mode; they are private. */
+  privacy?: "private";
+}
+
+/** A standard job. It holds no secrets: the account's credentials fetch the video. */
+export interface StandardJobHandle {
+  privacy: "standard";
+  jobId: string;
+  enclaveId: string;
+  profileId: string;
+  fallbackReason: string | null;
+  createdAt: number;
+}
+
+export type AnyJobHandle = JobHandle | StandardJobHandle;
+
+export function isStandardHandle(handle: AnyJobHandle): handle is StandardJobHandle {
+  return handle.privacy === "standard";
 }
 
 export interface GenerationResult {
@@ -71,9 +117,17 @@ export interface GenerationResult {
   receipt: Receipt;
   profileId: string;
   fallbackReason: string | null;
+  privacy: PrivacyMode;
 }
 
 export type SubmitStage = "routing" | "verifying" | "encrypting" | "uploading" | "submitting";
+
+export interface WaitOptions {
+  onProgress?: (status: JobStatus) => void;
+  signal?: AbortSignal;
+  pollMs?: number;
+  timeoutMs?: number;
+}
 
 export interface KunoClientOptions {
   apiKey?: string;
@@ -187,14 +241,23 @@ export class KunoClient {
     if (contentType) headers["content-type"] = contentType;
     const response = await this.fetchImpl(`${this.baseUrl}${path}`, { method, headers, body });
     if (!response.ok) {
-      let detail: { code?: string; message?: string } = {};
+      let detail: Record<string, unknown> = {};
       try {
         const json = (await response.json()) as { detail?: unknown };
-        detail = typeof json.detail === "object" && json.detail ? (json.detail as typeof detail) : { message: String(json.detail) };
+        detail =
+          typeof json.detail === "object" && json.detail && !Array.isArray(json.detail)
+            ? (json.detail as Record<string, unknown>)
+            : { message: String(json.detail) };
       } catch {
         /* non-JSON error body */
       }
-      throw new KunoError(response.status, detail.code ?? "error", detail.message ?? response.statusText);
+      const { code, message, ...rest } = detail;
+      throw new KunoError(
+        response.status,
+        typeof code === "string" ? code : "error",
+        typeof message === "string" ? message : response.statusText,
+        rest,
+      );
     }
     return response;
   }
@@ -216,15 +279,98 @@ export class KunoClient {
     return this.manifestCache;
   }
 
-  async route(mode: Mode, model?: string, family?: string): Promise<RouteResponse> {
+  /**
+   * Which profile and enclaves would serve a request. The credential is sent when the client has
+   * one, so the gateway can refuse private routing to an account that isn't eligible for it.
+   */
+  async route(mode: Mode, model?: string, family?: string, privacy?: PrivacyMode): Promise<RouteResponse> {
     const q = new URLSearchParams({ mode });
     if (model) q.set("profile_id", model);
     if (family) q.set("family", family);
-    return this.json<RouteResponse>("GET", `/v1/route?${q}`, undefined, false);
+    if (privacy === "standard") q.set("privacy", "standard");
+    return this.json<RouteResponse>("GET", `/v1/route?${q}`);
   }
 
-  /** Routes, verifies the enclave, encrypts inputs in this process, seals and submits. */
-  async submit(req: GenerateRequest, onStage?: (stage: SubmitStage) => void): Promise<JobHandle> {
+  /**
+   * Private (default): routes, verifies the enclave, encrypts inputs in this process, seals and
+   * submits. Standard: uploads the inputs as they are and lets the gateway seal the job.
+   */
+  submit(req: GenerateRequest & { privacy: "standard" }, onStage?: (stage: SubmitStage) => void): Promise<StandardJobHandle>;
+  submit(req: GenerateRequest & { privacy?: "private" }, onStage?: (stage: SubmitStage) => void): Promise<JobHandle>;
+  submit(req: GenerateRequest, onStage?: (stage: SubmitStage) => void): Promise<AnyJobHandle>;
+  async submit(req: GenerateRequest, onStage?: (stage: SubmitStage) => void): Promise<AnyJobHandle> {
+    return req.privacy === "standard" ? this.submitStandard(req, onStage) : this.submitPrivate(req, onStage);
+  }
+
+  /** Submits and waits: the one-call path. */
+  async generate(req: GenerateRequest, opts: WaitOptions & { onStage?: (stage: SubmitStage) => void } = {}): Promise<GenerationResult> {
+    return this.wait(await this.submit(req, opts.onStage), opts);
+  }
+
+  private async submitStandard(req: GenerateRequest, onStage?: (stage: SubmitStage) => void): Promise<StandardJobHandle> {
+    const inputs = req.inputs ?? [];
+    const roles = inputs.map((i) => i.role);
+    const mode = req.mode ?? inferMode(roles);
+
+    onStage?.("routing");
+    const route = await this.route(mode, req.model, req.family, "standard");
+    const profile = (await this.models(0)).models.find((m) => m.id === route.profile_id);
+    if (!profile) throw new KunoError(404, "unknown_model", `Unknown model ${route.profile_id}.`);
+    const params = fitParams(profile, mode, roles, req, route.fallback_reason);
+
+    const refs: Array<Record<string, unknown>> = [];
+    for (const [index, input] of inputs.entries()) {
+      const data = await toBytes(input.file);
+      const mime = sniffMime(data);
+      if (!mime) throw new KunoError(0, "unsupported_media", `Could not recognize the ${input.role} file type.`);
+      onStage?.("uploading");
+      const upload = await this.uploadStandard(input.role, data, mime);
+      refs.push({
+        upload_id: upload.upload_id,
+        index,
+        role: input.role,
+        time_s: input.timeS ?? null,
+        strength: input.strength ?? null,
+        hint: input.hint ?? null,
+        start_s: input.startS ?? null,
+        end_s: input.endS ?? null,
+      });
+    }
+
+    onStage?.("submitting");
+    const status = await this.json<JobStatus>("POST", "/v1/standard/videos", {
+      job_id: crypto.randomUUID(),
+      params,
+      prompt: req.prompt,
+      negative_prompt: req.negativePrompt ?? null,
+      seed: req.seed ?? null,
+      options: req.options ?? {},
+      inputs: refs,
+    });
+    return {
+      privacy: "standard",
+      jobId: status.job_id,
+      enclaveId: status.enclave_id,
+      profileId: status.params?.profile_id ?? profile.id,
+      fallbackReason: route.fallback_reason,
+      createdAt: status.created_at ?? Date.now() / 1000,
+    };
+  }
+
+  /**
+   * Uploads one standard-mode input as plaintext. The gateway detects the type from the bytes
+   * (the content-type sent is informational). Uploads are scanned: a match is `upload_blocked`,
+   * and `scan_unavailable` means the scanner couldn't be reached.
+   */
+  async uploadStandard(role: InputRole, file: Blob | Uint8Array, mime?: string): Promise<StandardUpload> {
+    const data = await toBytes(file);
+    const type = mime ?? sniffMime(data);
+    if (!type) throw new KunoError(0, "unsupported_media", `Could not recognize the ${role} file type.`);
+    const response = await this.request("POST", `/v1/standard/uploads?role=${encodeURIComponent(role)}`, new Blob([new Uint8Array(data)]), type);
+    return (await response.json()) as StandardUpload;
+  }
+
+  private async submitPrivate(req: GenerateRequest, onStage?: (stage: SubmitStage) => void): Promise<JobHandle> {
     const inputs = req.inputs ?? [];
     const roles = inputs.map((i) => i.role);
     const mode = req.mode ?? inferMode(roles);
@@ -323,10 +469,7 @@ export class KunoClient {
     return this.json<JobStatus>("POST", `/v1/videos/${jobId}/cancel`);
   }
 
-  async wait(
-    handle: JobHandle,
-    opts: { onProgress?: (status: JobStatus) => void; signal?: AbortSignal; pollMs?: number; timeoutMs?: number } = {},
-  ): Promise<GenerationResult> {
+  async wait(handle: AnyJobHandle, opts: WaitOptions = {}): Promise<GenerationResult> {
     const deadline = Date.now() + (opts.timeoutMs ?? 30 * 60 * 1000);
     for (;;) {
       if (opts.signal?.aborted) throw new KunoError(0, "aborted", "Stopped waiting for the video.");
@@ -347,9 +490,22 @@ export class KunoClient {
     }
   }
 
-  /** Downloads the sealed video, checks it against the enclave-signed receipt, decrypts locally. */
-  async result(handle: JobHandle, status?: JobStatus): Promise<GenerationResult> {
+  /**
+   * Private: downloads the sealed video, checks it against the enclave-signed receipt, decrypts
+   * locally. Standard: downloads the stored video and checks it against the receipt's content digest.
+   */
+  async result(handle: AnyJobHandle, status?: JobStatus): Promise<GenerationResult> {
     status ??= await this.status(handle.jobId);
+    if (isStandardHandle(handle)) {
+      if (status.status !== "succeeded" || !status.receipt) {
+        throw new KunoError(0, "not_ready", `Job ${handle.jobId} is ${status.status}.`);
+      }
+      const video = await this.standardVideo(handle.jobId);
+      if ((await sha256Hex(video)) !== status.receipt.body.content_digest) {
+        throw new KunoError(0, "integrity", "The downloaded video does not match the enclave's receipt.");
+      }
+      return { jobId: handle.jobId, video, receipt: status.receipt, profileId: handle.profileId, fallbackReason: handle.fallbackReason, privacy: "standard" };
+    }
     if (status.status !== "succeeded" || !status.receipt || !status.output_blob_id) {
       throw new KunoError(0, "not_ready", `Job ${handle.jobId} is ${status.status}.`);
     }
@@ -370,7 +526,46 @@ export class KunoClient {
     if ((await sha256Hex(video)) !== receipt.body.content_digest) {
       throw new KunoError(0, "integrity", "The decrypted video does not match the receipt.");
     }
-    return { jobId: handle.jobId, video, receipt, profileId: handle.profileId, fallbackReason: handle.fallbackReason };
+    return { jobId: handle.jobId, video, receipt, profileId: handle.profileId, fallbackReason: handle.fallbackReason, privacy: "private" };
+  }
+
+  // ------------------------------------------------------------ standard library
+
+  /** This account's standard jobs, newest first. */
+  async listStandard(limit = 50): Promise<StandardVideoSummary[]> {
+    return this.json<StandardVideoSummary[]>("GET", `/v1/standard/videos?limit=${limit}`);
+  }
+
+  /** A standard job's video (`not_ready` until it succeeds, `expired` after retention). */
+  async standardVideo(jobId: string): Promise<Uint8Array> {
+    return new Uint8Array(await (await this.request("GET", `/v1/standard/videos/${encodeURIComponent(jobId)}/video`)).arrayBuffer());
+  }
+
+  /** A JPEG frame of a standard job's video. */
+  async standardThumbnail(jobId: string): Promise<Uint8Array> {
+    return new Uint8Array(await (await this.request("GET", `/v1/standard/videos/${encodeURIComponent(jobId)}/thumbnail`)).arrayBuffer());
+  }
+
+  /** Deletes the stored video, prompt and inputs of a standard job. The billing record stays. */
+  async deleteStandard(jobId: string): Promise<void> {
+    await this.request("DELETE", `/v1/standard/videos/${encodeURIComponent(jobId)}`);
+  }
+
+  /** A handle for a standard job listed by `listStandard`, to wait on or fetch it. */
+  standardHandle(summary: Pick<StandardVideoSummary, "job_id" | "profile_id" | "created_at">): StandardJobHandle {
+    return { privacy: "standard", jobId: summary.job_id, enclaveId: "", profileId: summary.profile_id, fallbackReason: null, createdAt: summary.created_at };
+  }
+
+  // ------------------------------------------------------------ account safety
+
+  /** Whether this account may make private jobs, and any restriction or strikes. */
+  async eligibility(): Promise<Eligibility> {
+    return this.json<Eligibility>("GET", "/v1/account/eligibility");
+  }
+
+  /** Public: report a video. No credential is sent. */
+  async report(req: ReportRequest): Promise<{ report_id: string }> {
+    return this.json<{ report_id: string }>("POST", "/v1/reports", req, false);
   }
 
   /** Public: look up the certificate for a video file by its SHA-256. */

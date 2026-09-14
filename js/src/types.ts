@@ -24,6 +24,16 @@ export type InputRole =
 
 export type JobState = "queued" | "running" | "succeeded" | "failed" | "canceled";
 
+/**
+ * Who can read a job. `private` (the default) is end to end encrypted to a confidential-tier
+ * enclave; `standard` is sent to KunoWorld readable, so KunoWorld and the GPU provider can see it.
+ * The mode is not part of GenerationParams: those are the encryption's associated data.
+ */
+export type PrivacyMode = "private" | "standard";
+
+/** Attestation evidence kinds. `open` is a no-TEE miner, which only ever serves standard jobs. */
+export type TeeKind = "mock" | "tdx" | "open";
+
 export interface InputGroup {
   roles: InputRole[];
   max: number;
@@ -160,10 +170,12 @@ export interface JobStatus {
   /** Machine-readable failure reason (e.g. safety_blocked, timeout); `error` is the human message. */
   error_code: string | null;
   error: string | null;
+  /** Gateways from before standard mode omit it; a missing value means `private`. */
+  privacy?: PrivacyMode;
 }
 
 export interface AttestationEvidence {
-  tee: "mock" | "tdx";
+  tee: TeeKind;
   quote: string;
   gpu_evidence: string | null;
   nonce: string;
@@ -197,7 +209,7 @@ export interface GoldenManifest {
 export interface EnclaveInfo {
   enclave_id: string;
   miner_hotkey: string | null;
-  tee: "mock" | "tdx";
+  tee: TeeKind;
   image_digest: string;
   hpke_public_key: string;
   signing_public_key: string;
@@ -216,6 +228,64 @@ export interface RouteResponse {
   requested_profile_id: string | null;
   fallback_reason: "region" | "switched_off" | "capacity" | null;
   enclaves: EnclaveInfo[];
+}
+
+/** `POST /v1/standard/uploads` */
+export interface StandardUpload {
+  upload_id: string;
+  sha256: string;
+  size: number;
+  mime: string;
+}
+
+/** One row of `GET /v1/standard/videos`: this account's standard jobs, newest first. */
+export interface StandardVideoSummary {
+  job_id: string;
+  status: JobState;
+  profile_id: string;
+  params: GenerationParams;
+  prompt: string;
+  created_at: number;
+  finished_at: number | null;
+  has_video: boolean;
+  error_code: string | null;
+  /** When the stored video, prompt and inputs are deleted (Unix seconds). */
+  expires_at: number | null;
+  /** Deleted by the owner or removed after review; the row stays for billing. */
+  deleted: boolean;
+}
+
+/** `GET /v1/account/eligibility` (API key or studio token) and `GET /v1/me/eligibility` (web session). */
+export interface Eligibility {
+  private_mode: { eligible: boolean; reasons: string[] };
+  /**
+   * Unix seconds; null when the account isn't restricted. A restriction that lasts until an
+   * operator reviews the account is 253402300799 (the last second of year 9999).
+   */
+  restricted_until: number | null;
+  strikes_24h: number;
+  strikes_7d: number;
+}
+
+export type ReportReason =
+  | "csam"
+  | "sexual_minor"
+  | "nonconsensual_intimate"
+  | "violent_extremism"
+  | "harassment"
+  | "copyright"
+  | "other";
+
+/** `POST /v1/reports`: identify the video by at least one of content_digest, job_id or url. */
+export interface ReportRequest {
+  content_digest?: string;
+  job_id?: string;
+  url?: string;
+  reason: ReportReason;
+  details?: string;
+  /** Base64url output key of a private video, so that one video can be reviewed. */
+  output_key?: string;
+  contact_email?: string;
 }
 
 export interface Provenance {
