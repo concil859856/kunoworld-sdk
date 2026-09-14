@@ -276,4 +276,8 @@ when you are done.
 
 Failures raise `KunoError` with `status`, `code`, `message` and `details` (the rest of the error
 body, with `reasons` and `restricted_until` properties). The gateway holds a job's price
-when it is submitted and refunds it automatically if the job fails, is canceled or times out.
+when it is submitted and refunds it automatically if the job fails, is blocked (`safety_blocked`),
+is canceled or times out. A profile's `pricing.usd_per_second` is the Private price and
+`pricing.standard_usd_per_second` the lower Standard one (`kuno_protocol` computes a job's price
+with `profile.price_usd(params, privacy)`). Full MiniMax H3 and H3 Director are Private-only, so a
+Standard request for them fails with `privacy_mode_unavailable`. All prices are placeholders.

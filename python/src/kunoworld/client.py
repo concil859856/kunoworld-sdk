@@ -849,10 +849,12 @@ def _fit_params(
         aspect_ratio = "16:9" if "16:9" in sizes else next(iter(sizes), "16:9")
     if fps is None or (lenient and fps not in lim.fps):
         fps = lim.default_fps
+    # Some profiles render shorter clips at high frame rates (LTX-2.5 Fast goes past 10 s only at 24 or 25 fps).
+    max_duration = min(lim.max_duration_s, lim.max_duration_s_by_fps.get(fps, lim.max_duration_s))
     if duration_s is None:
-        duration_s = min(max(5.0, lim.min_duration_s), lim.max_duration_s)
+        duration_s = min(max(5.0, lim.min_duration_s), max_duration)
     elif lenient:
-        duration_s = min(max(duration_s, lim.min_duration_s), lim.max_duration_s)
+        duration_s = min(max(duration_s, lim.min_duration_s), max_duration)
     return GenerationParams(
         profile_id=profile.id,
         mode=mode,

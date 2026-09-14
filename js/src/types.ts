@@ -55,6 +55,44 @@ export interface Limits {
   negative_prompt: boolean;
   prompt_enhancer: boolean;
   seed: boolean;
+  /** fps -> a lower duration cap at that frame rate (LTX-2.5 Fast goes past 10 s only at 24 or 25 fps). */
+  max_duration_s_by_fps?: Record<string, number>;
+}
+
+/** A profile's prices. Every price is a placeholder while `pricing_placeholder` is true. */
+export interface Pricing {
+  /** The Private price per second, per resolution. Private is the default mode. */
+  usd_per_second: Record<string, number>;
+  /** The Standard price per second, per resolution; null or absent where the profile is Private-only. */
+  standard_usd_per_second?: Record<string, number> | null;
+  /** No job costs less than this, after multipliers. */
+  min_job_usd?: number;
+  /** A multiplier on the whole job once its duration exceeds `over_s`. */
+  long_clip?: { over_s: number; multiplier: number } | null;
+  /** fps -> a multiplier on the whole job. */
+  fps_multipliers?: Record<string, number>;
+}
+
+/**
+ * GPU-cost weights for miner pay: a job's VCU is per_output_second[resolution] × fps_multiplier[fps]
+ * × (1 + duration_slope × max(0, seconds − 5)) × seconds. Validators use them; customers never pay by them.
+ */
+export interface VcuWeights {
+  per_output_second: Record<string, number>;
+  duration_slope?: number;
+  fps_multiplier?: Record<string, number>;
+  note?: string | null;
+}
+
+/** What a job costs, from `priceQuote`. */
+export interface PriceQuote {
+  usd: number;
+  /** The per-second rate for the resolution and privacy mode, before multipliers. */
+  usdPerSecond: number;
+  /** The fps and long-clip multipliers, together. */
+  multiplier: number;
+  /** True when the profile's minimum charge set the price. */
+  minimumApplied: boolean;
 }
 
 export interface ModelProfile {
@@ -71,8 +109,12 @@ export interface ModelProfile {
   gpus_per_worker: number;
   steps: number;
   license: { name: string; url: string; attribution: string | null; region_policy: string | null };
-  pricing: { usd_per_second: Record<string, number> };
-  vcu_per_output_second: number;
+  pricing: Pricing;
+  /** Present on /v1/models responses: the privacy modes the profile is sold in (Private always). */
+  privacy_modes?: PrivacyMode[];
+  /** Miner pay weights (verified video compute units); gateways from before them send `vcu_per_output_second`. */
+  vcu_weights?: VcuWeights;
+  vcu_per_output_second?: number;
   timeout_s: number;
   /** Present on /v1/models responses. */
   enabled?: boolean;

@@ -12,6 +12,7 @@ import type {
   Mode,
   ModelProfile,
   ModelsResponse,
+  PriceQuote,
   PrivacyMode,
   Provenance,
   Receipt,
@@ -229,9 +230,39 @@ export function inferMode(roles: InputRole[]): Mode {
   return "text_to_video";
 }
 
-export function priceUsd(profile: ModelProfile, resolution: string, durationS: number): number | null {
-  const rate = profile.pricing.usd_per_second[resolution];
-  return rate === undefined ? null : Math.round(rate * durationS * 10000) / 10000;
+/** The privacy modes a profile is sold in: `privacy_modes` from /v1/models, else read from its pricing. */
+export function privacyModes(profile: ModelProfile): PrivacyMode[] {
+  if (profile.privacy_modes) return profile.privacy_modes;
+  return profile.pricing.standard_usd_per_second ? ["private", "standard"] : ["private"];
+}
+
+/**
+ * The gateway's price for a job (kuno_protocol `ModelProfile.price_usd`): the per-second rate for the privacy
+ * mode x duration x the fps and long-clip multipliers, never below the profile's minimum charge. Null where the
+ * profile has no such price: a resolution it doesn't render, or Standard on a Private-only profile.
+ */
+export function priceQuote(
+  profile: ModelProfile,
+  params: Pick<GenerationParams, "resolution" | "duration_s" | "fps">,
+  privacy: PrivacyMode = "private",
+): PriceQuote | null {
+  const pricing = profile.pricing;
+  if (!privacyModes(profile).includes(privacy)) return null;
+  const rate = (privacy === "private" ? pricing.usd_per_second : pricing.standard_usd_per_second)?.[params.resolution];
+  if (rate === undefined) return null;
+  let multiplier = pricing.fps_multipliers?.[String(params.fps)] ?? 1;
+  if (pricing.long_clip && params.duration_s > pricing.long_clip.over_s) multiplier *= pricing.long_clip.multiplier;
+  const raw = rate * params.duration_s * multiplier;
+  const minimum = pricing.min_job_usd ?? 0;
+  return { usd: Math.round(Math.max(minimum, raw) * 10000) / 10000, usdPerSecond: rate, multiplier, minimumApplied: raw < minimum };
+}
+
+export function priceUsd(
+  profile: ModelProfile,
+  params: Pick<GenerationParams, "resolution" | "duration_s" | "fps">,
+  privacy: PrivacyMode = "private",
+): number | null {
+  return priceQuote(profile, params, privacy)?.usd ?? null;
 }
 
 /** Same rules as the Python SDK: defaults from the profile; adapt after a fallback. */
@@ -251,9 +282,11 @@ export function fitParams(
   if (aspect === undefined || (lenient && !(aspect in sizes))) aspect = "16:9" in sizes ? "16:9" : Object.keys(sizes)[0] ?? "16:9";
   let fps = req.fps;
   if (fps === undefined || (lenient && !lim.fps.includes(fps))) fps = lim.default_fps;
+  // Some profiles render shorter clips at high frame rates (LTX-2.5 Fast goes past 10 s only at 24 or 25 fps).
+  const maxDuration = Math.min(lim.max_duration_s, lim.max_duration_s_by_fps?.[String(fps)] ?? lim.max_duration_s);
   let duration = req.durationS;
-  if (duration === undefined) duration = Math.min(Math.max(5, lim.min_duration_s), lim.max_duration_s);
-  else if (lenient) duration = Math.min(Math.max(duration, lim.min_duration_s), lim.max_duration_s);
+  if (duration === undefined) duration = Math.min(Math.max(5, lim.min_duration_s), maxDuration);
+  else if (lenient) duration = Math.min(Math.max(duration, lim.min_duration_s), maxDuration);
   return {
     profile_id: profile.id,
     mode,

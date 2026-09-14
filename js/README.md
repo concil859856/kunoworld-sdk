@@ -290,7 +290,12 @@ error body in `details` (with `reasons` and `restrictedUntil` getters). The pack
 `tdx`, so a private job is never sealed to an open-tier miner.
 
 The gateway holds a job's price when it is submitted and refunds it automatically if the job
-fails, is canceled or times out.
+fails, is blocked (`safety_blocked`), is canceled or times out. `priceUsd(profile, params, privacy)`
+and `priceQuote` estimate that price from a profile: `pricing.usd_per_second` is the Private
+price and `pricing.standard_usd_per_second` the lower Standard one, the fps and long-clip
+multipliers apply to the whole job, and no job costs less than `pricing.min_job_usd`. Full
+MiniMax H3 and H3 Director are Private-only (`privacyModes(profile)` is `["private"]`), so a
+Standard request for them fails with `privacy_mode_unavailable`. All prices are placeholders.
 
 ## Develop
 
