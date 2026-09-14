@@ -17,6 +17,11 @@ import type {
   Receipt,
   ReportRequest,
   RouteResponse,
+  SharedVideo,
+  SharedVideoDetails,
+  ShareLink,
+  ShareStatus,
+  ShareSummary,
   StandardUpload,
   StandardVideoSummary,
 } from "./types.js";
@@ -74,12 +79,17 @@ export const ERROR_CODES = {
   account_restricted: "The account is restricted; see `restricted_until`.",
   upload_blocked: "A Standard upload was refused by the scan.",
   insufficient_balance: "The balance doesn't cover the job's price.",
-  not_found: "No such job, blob or video on this account.",
+  not_found: "No such job, blob or video on this account, or no such share link.",
   deleted: "The owner deleted this video.",
   removed: "The video was removed after a review under the content policy.",
   not_ready: "The job hasn't finished yet.",
   integrity: "What came back didn't match the enclave-signed receipt.",
-  decrypt_failed: "The video didn't open with this handle's output key.",
+  decrypt_failed: "The video didn't open with this handle's output key, or with a share link's key.",
+  share_unavailable: "The share link no longer works (revoked, expired, video deleted or removed, or account closed; the public answer never says which), or, when making one, the video can't be shared right now.",
+  missing_key: "A private share link needs the video's key: the #k=… part of the link, or pass it separately.",
+  too_many_shares: "Too many working share links: 20 per video and 1000 per account. Revoke some first.",
+  invalid_expiry: "A share link's expiry must be between a minute and ten years from now, in Unix seconds, or null.",
+  rate_limited: "Too many requests from this network to public share links. Try again in a minute.",
 } as const;
 
 export type KunoErrorCode = keyof typeof ERROR_CODES;
@@ -269,11 +279,145 @@ async function toBytes(file: Blob | Uint8Array): Promise<Uint8Array> {
   return file instanceof Uint8Array ? file : new Uint8Array(await file.arrayBuffer());
 }
 
+// ------------------------------------------------------------ share links
+
+/** A share token and an output key are both 32 bytes written as base64url: 43 characters. */
+const BASE64URL_32 = /^[A-Za-z0-9_-]{43}$/;
+
+function outputKeyText(outputKey: string | Uint8Array): string {
+  const text = typeof outputKey === "string" ? outputKey : outputKey.length === 32 ? b64e(outputKey) : "";
+  if (!BASE64URL_32.test(text)) throw new KunoError(0, "invalid_key", "An output key is 32 bytes, written as base64url (43 characters).");
+  return text;
+}
+
+/**
+ * A private video's share link with its key as the fragment, `#k=…`. Browsers never send a
+ * fragment, so the key doesn't reach KunoWorld, but anyone given the whole link can open the
+ * video. `outputKey` is a handle's `outputKey` (or the 32 raw bytes). Replaces any fragment.
+ */
+export function shareUrlWithKey(url: string, outputKey: string | Uint8Array): string {
+  const key = outputKeyText(outputKey);
+  const hashAt = url.indexOf("#");
+  return `${hashAt === -1 ? url : url.slice(0, hashAt)}#k=${key}`;
+}
+
+/**
+ * A share link's token, and the key from its `#k=` fragment when it has one. Accepts a full link
+ * (`https://kunoworld.com/s/<token>#k=<key>`), a path (`/s/<token>`) or a bare token. Anything
+ * else throws `not_found` before a request is made.
+ */
+export function parseShareLink(link: string): { token: string; key: string | null } {
+  const text = link.trim();
+  const hashAt = text.indexOf("#");
+  const beforeHash = hashAt === -1 ? text : text.slice(0, hashAt);
+  const path = beforeHash.split("?")[0].replace(/\/+$/, "");
+  const token = path.slice(path.lastIndexOf("/") + 1);
+  if (!BASE64URL_32.test(token)) throw new KunoError(0, "not_found", "That isn't a valid share link.");
+  const key = hashAt === -1 ? null : new URLSearchParams(text.slice(hashAt + 1)).get("k");
+  return { token, key: key || null };
+}
+
+export interface CreateShareOptions {
+  /** When the link stops working: Unix seconds or a Date, from a minute to ten years ahead. Null or absent: until revoked. */
+  expiresAt?: number | Date | null;
+}
+
+export interface ListSharesOptions {
+  /** Only this video's links. */
+  jobId?: string;
+  /** Default 100; the gateway returns at most 500. */
+  limit?: number;
+}
+
+/** `kuno.shares`: links that let anyone holding them watch one video. */
+export interface ShareLinks {
+  /**
+   * Makes a link to one of this account's finished videos (`POST /v1/videos/{id}/shares`). Given a
+   * private `JobHandle`, `url` carries its key as `#k=…`; given a job id, add it with `shareUrlWithKey`.
+   */
+  create(target: string | AnyJobHandle, opts?: CreateShareOptions): Promise<ShareLink>;
+  /** This account's links, newest first, with each one's `status` and `viewCount`. Tokens aren't kept, so they aren't here. */
+  list(opts?: ListSharesOptions): Promise<ShareSummary[]>;
+  /** Stops a link for good. Revoking twice is harmless. */
+  revoke(shareId: string): Promise<ShareSummary>;
+  /** Public, no credential sent: what a link shows (mode, model, dates, receipt), plus its token and fragment key. */
+  get(tokenOrUrl: string): Promise<SharedVideoDetails>;
+  /**
+   * Public, no credential sent: downloads a shared video and checks it against the receipt. A
+   * private link needs its key, from the link's fragment or `key`; it is decrypted here.
+   */
+  open(url: string, key?: string): Promise<SharedVideo>;
+}
+
+interface ShareRowWire {
+  share_id: string;
+  job_id: string;
+  privacy: PrivacyMode;
+  profile_id: string | null;
+  created_at: number;
+  expires_at: number | null;
+  revoked_at: number | null;
+  status: ShareStatus;
+  view_count: number;
+}
+
+interface ShareLinkWire extends ShareRowWire {
+  token: string;
+  url_path: string;
+  url: string;
+}
+
+interface SharedVideoWire {
+  privacy: PrivacyMode;
+  profile_id: string;
+  created_at: number;
+  shared_at: number;
+  expires_at: number | null;
+  content_digest: string;
+  receipt: Receipt | null;
+  signing_public_key: string | null;
+}
+
+function shareSummary(row: ShareRowWire): ShareSummary {
+  return {
+    shareId: row.share_id,
+    jobId: row.job_id,
+    privacy: row.privacy,
+    profileId: row.profile_id,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    revokedAt: row.revoked_at,
+    status: row.status,
+    viewCount: row.view_count,
+  };
+}
+
+function receiptSignedBy(receipt: Receipt, signingPublicKey: string | null): boolean {
+  if (!signingPublicKey) return false;
+  try {
+    return verifyReceipt(receipt, b64d(signingPublicKey));
+  } catch {
+    return false;
+  }
+}
+
 export class KunoClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private manifestCache: GoldenManifest | undefined;
   private modelsCache: { at: number; value: ModelsResponse } | undefined;
+
+  /**
+   * Share links. `create`, `list` and `revoke` use this client's credential; `get` and `open` are
+   * public and send none, so a client without an API key can open any link.
+   */
+  readonly shares: ShareLinks = {
+    create: (target, opts) => this.createShare(target, opts),
+    list: (opts) => this.listShares(opts),
+    revoke: (shareId) => this.revokeShare(shareId),
+    get: (tokenOrUrl) => this.sharedVideoDetails(tokenOrUrl),
+    open: (url, key) => this.openSharedVideo(url, key),
+  };
 
   constructor(private readonly opts: KunoClientOptions = {}) {
     if (opts.apiKey?.startsWith("kwt_")) {
@@ -646,5 +790,98 @@ export class KunoClient {
   /** Public: the same lookup when you already have the digest (e.g. a /verify?sha256=… link). */
   async provenanceByDigest(contentDigest: string): Promise<Provenance> {
     return this.json<Provenance>("GET", `/v1/provenance/${encodeURIComponent(contentDigest.toLowerCase())}`, undefined, false);
+  }
+
+  // ------------------------------------------------------------ share links (see `shares`)
+
+  private async createShare(target: string | AnyJobHandle, opts: CreateShareOptions = {}): Promise<ShareLink> {
+    const jobId = typeof target === "string" ? target : target.jobId;
+    // Check a handle's key before the link exists, so a bad key can't leave a link behind.
+    const outputKey = typeof target !== "string" && !isStandardHandle(target) ? outputKeyText(target.outputKey) : null;
+    const given = opts.expiresAt;
+    const expiresAt = given instanceof Date ? given.getTime() / 1000 : given ?? null;
+    if (expiresAt !== null && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) {
+      throw new KunoError(0, "invalid_expiry", ERROR_CODES.invalid_expiry);
+    }
+    const row = await this.json<ShareLinkWire>("POST", `/v1/videos/${encodeURIComponent(jobId)}/shares`, { expires_at: expiresAt });
+    const link: ShareLink = { ...shareSummary(row), token: row.token, urlPath: row.url_path, url: row.url, keyIncluded: false };
+    if (outputKey !== null && row.privacy === "private") {
+      link.url = shareUrlWithKey(row.url, outputKey);
+      link.keyIncluded = true;
+    }
+    return link;
+  }
+
+  private async listShares(opts: ListSharesOptions = {}): Promise<ShareSummary[]> {
+    const q = new URLSearchParams();
+    if (opts.jobId) q.set("job_id", opts.jobId);
+    q.set("limit", String(opts.limit ?? 100));
+    return (await this.json<ShareRowWire[]>("GET", `/v1/account/shares?${q}`)).map(shareSummary);
+  }
+
+  private async revokeShare(shareId: string): Promise<ShareSummary> {
+    return shareSummary(await this.json<ShareRowWire>("DELETE", `/v1/account/shares/${encodeURIComponent(shareId)}`));
+  }
+
+  private async sharedVideoDetails(tokenOrUrl: string): Promise<SharedVideoDetails> {
+    const { token, key } = parseShareLink(tokenOrUrl);
+    const d = await this.json<SharedVideoWire>("GET", `/v1/shares/${token}`, undefined, false);
+    return {
+      privacy: d.privacy,
+      profileId: d.profile_id,
+      createdAt: d.created_at,
+      sharedAt: d.shared_at,
+      expiresAt: d.expires_at,
+      contentDigest: d.content_digest,
+      receipt: d.receipt,
+      signingPublicKey: d.signing_public_key,
+      token,
+      key,
+    };
+  }
+
+  private async openSharedVideo(url: string, key?: string): Promise<SharedVideo> {
+    const details = await this.sharedVideoDetails(url);
+    const outputKey = key || details.key;
+    const isPrivate = details.privacy === "private";
+    if (isPrivate && !outputKey) throw new KunoError(0, "missing_key", ERROR_CODES.missing_key);
+    const receipt = details.receipt;
+    if (!receipt?.body || receipt.body.content_digest !== details.contentDigest) {
+      throw new KunoError(0, "integrity", "The link's receipt doesn't describe this video.");
+    }
+    const response = await this.request("GET", `/v1/shares/${details.token}/video`, undefined, undefined, false);
+    const data = new Uint8Array(await response.arrayBuffer());
+    const opened = (video: Uint8Array): SharedVideo => ({
+      privacy: isPrivate ? "private" : "standard",
+      video,
+      receipt,
+      contentDigest: details.contentDigest,
+      profileId: details.profileId ?? receipt.body.profile_id,
+    });
+    if (!isPrivate) {
+      if ((await sha256Hex(data)) !== details.contentDigest) {
+        throw new KunoError(0, "integrity", "The shared video does not match its receipt.");
+      }
+      return opened(data);
+    }
+    if ((await sha256Hex(data)) !== receipt.body.output_digest) {
+      throw new KunoError(0, "integrity", "The shared video does not match the enclave's receipt.");
+    }
+    if (!receiptSignedBy(receipt, details.signingPublicKey)) {
+      throw new KunoError(0, "integrity", "The receipt was not signed by the enclave that made this video.");
+    }
+    let video: Uint8Array;
+    try {
+      const keyBytes = b64d(outputKey as string);
+      if (keyBytes.length !== 32) throw new Error("an output key is 32 bytes");
+      // The label binds the blob to the signed receipt's job: a blob sealed for another job doesn't open.
+      video = decryptBlob(keyBytes, `${receipt.body.job_id}/output/video`, data);
+    } catch {
+      throw new KunoError(0, "decrypt_failed", "This video didn't open with the link's key.");
+    }
+    if ((await sha256Hex(video)) !== details.contentDigest) {
+      throw new KunoError(0, "integrity", "The decrypted video does not match the receipt.");
+    }
+    return opened(video);
   }
 }

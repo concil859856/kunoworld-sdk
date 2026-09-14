@@ -10,10 +10,26 @@
  */
 
 export * from "./types.js";
-export { ERROR_CODES, KunoClient, KunoError, fitParams, inferMode, isStandardHandle, jobAad, priceUsd, sniffMime, verifyReceipt } from "./client.js";
+export {
+  ERROR_CODES,
+  KunoClient,
+  KunoError,
+  fitParams,
+  inferMode,
+  isStandardHandle,
+  jobAad,
+  parseShareLink,
+  priceUsd,
+  shareUrlWithKey,
+  sniffMime,
+  verifyReceipt,
+} from "./client.js";
 export type {
   KunoErrorCode,
   AnyJobHandle,
+  CreateShareOptions,
+  ListSharesOptions,
+  ShareLinks,
   GenerateInput,
   GenerateRequest,
   GenerationResult,
@@ -25,5 +41,19 @@ export type {
 } from "./client.js";
 export { enclaveIdFor, gpuNonceFor, parseTdxQuote, reportDataFor, verifyEvidence } from "./attestation.js";
 export type { Verdict } from "./attestation.js";
-export { DecryptionError, decryptBlob, encryptBlob, openSenderSession, sha256Hex } from "./crypto.js";
+export {
+  BLOB_V1,
+  BLOB_V2,
+  DEFAULT_BLOB_VERSION,
+  DecryptionError,
+  blobVersion,
+  decryptBlob,
+  encryptBlob,
+  openSenderSession,
+  paddedStreamLength,
+  padme,
+  sealedBlobSize,
+  sha256Hex,
+} from "./crypto.js";
+export type { BlobVersion } from "./crypto.js";
 export { b64d, b64e, canonicalJson, fromHex, toHex } from "./encoding.js";

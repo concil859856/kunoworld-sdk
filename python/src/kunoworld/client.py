@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import math
+import re
 import time
 import uuid
 import warnings
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Union
+from urllib.parse import parse_qs, quote
 
 import httpx
 
 from kuno_protocol.attestation import AttestationEvidence, GoldenManifest, verify_evidence
 from kuno_protocol.blobs import decrypt_blob, encrypt_blob
 from kuno_protocol.canonical import b64d, b64e, sha256_hex
-from kuno_protocol.crypto import SenderSession
+from kuno_protocol.crypto import DecryptionError, SenderSession
 from kuno_protocol.media import sniff_mime
 from kuno_protocol.profiles import InputRole, Mode, ModelProfile
 from kuno_protocol.receipts import Receipt, verify_receipt
@@ -52,11 +56,18 @@ ERROR_CODES: dict[str, str] = {
     "account_restricted": "The account is restricted; see `restricted_until`.",
     "upload_blocked": "A Standard upload was refused by the scan.",
     "insufficient_balance": "The balance doesn't cover the job's price.",
-    "not_found": "No such job, blob or video on this account.",
+    "not_found": "No such job, blob or video on this account, or no such share link.",
     "deleted": "The owner deleted this video.",
     "removed": "The video was removed after a review under the content policy.",
     "not_ready": "The job hasn't finished yet.",
     "integrity": "What came back didn't match the enclave-signed receipt.",
+    "decrypt_failed": "The video didn't open with this key.",
+    "share_unavailable": "The share link no longer works (revoked, expired, video deleted or removed, or account closed; the "
+    "public answer never says which), or, when making one, the video can't be shared right now.",
+    "missing_key": "A private share link needs the video's key: the #k=... part of the link, or pass it separately.",
+    "too_many_shares": "Too many working share links: 20 per video and 1000 per account. Revoke some first.",
+    "invalid_expiry": "A share link's expiry must be between a minute and ten years from now, in Unix seconds, or None.",
+    "rate_limited": "Too many requests from this network to public share links. Try again in a minute.",
 }
 
 
@@ -293,6 +304,14 @@ class KunoClient:
         }
         body = {k: v for k, v in fields.items() if v is not None}
         return self._request("POST", "/v1/reports", json=body, auth=False).json()["report_id"]
+
+    # ------------------------------------------------------------ share links
+
+    @property
+    def shares(self) -> ShareLinks:
+        """Share links: `create`, `list` and `revoke` use this client's API key; `get` and `open` are public and send
+        no credential."""
+        return ShareLinks(self)
 
     # ------------------------------------------------------------ standard library
 
@@ -657,6 +676,138 @@ class StandardVideoJob:
     def delete(self) -> None:
         """Deletes the stored video, prompt, inputs and preview. The billing record stays."""
         self.client.delete(self.job_id)
+
+
+# A share token and an output key are both 32 bytes written as base64url: 43 characters.
+_BASE64URL_32 = re.compile(r"[A-Za-z0-9_-]{43}")
+
+
+def parse_share_link(link: str) -> tuple[str, str | None]:
+    """A share link's token, and the key from its `#k=` fragment when it has one. Accepts a full link
+    (`https://kunoworld.com/s/<token>#k=<key>`), a path (`/s/<token>`) or a bare token. Anything else raises
+    `not_found` before a request is made."""
+    before, _, fragment = link.strip().partition("#")
+    token = before.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+    if not _BASE64URL_32.fullmatch(token):
+        raise KunoError(0, "not_found", "That isn't a valid share link.")
+    key = parse_qs(fragment).get("k", [""])[0] if fragment else ""
+    return token, key or None
+
+
+def share_url_with_key(url: str, output_key: str | bytes) -> str:
+    """A private video's share link with its key as the fragment, `#k=...`. Browsers never send a fragment, so the key
+    doesn't reach KunoWorld, but anyone given the whole link can open the video. `output_key` is the 32 raw bytes
+    (`VideoJob.output_key`) or their base64url text (`export()["output_key"]`). Replaces any fragment."""
+    return f"{url.partition('#')[0]}#k={_output_key_text(output_key)}"
+
+
+def _output_key_text(output_key: str | bytes) -> str:
+    text = b64e(output_key) if isinstance(output_key, bytes) and len(output_key) == 32 else output_key
+    if not isinstance(text, str) or not _BASE64URL_32.fullmatch(text):
+        raise KunoError(0, "invalid_key", "An output key is 32 bytes, written as base64url (43 characters).")
+    return text
+
+
+def _output_key_bytes(output_key: str | bytes) -> bytes:
+    raw = output_key if isinstance(output_key, bytes) else b64d(output_key)
+    if len(raw) != 32:
+        raise ValueError("an output key is 32 bytes")
+    return raw
+
+
+def _signed_by(receipt: Receipt, signing_public_key: Any) -> bool:
+    if not isinstance(signing_public_key, str) or not signing_public_key:
+        return False
+    try:
+        return verify_receipt(receipt, b64d(signing_public_key))
+    except ValueError:
+        return False
+
+
+class ShareLinks:
+    """`client.shares`: links that let anyone holding them watch one video.
+
+    `create`, `list` and `revoke` use the client's API key. `get` and `open` are public and send no credential."""
+
+    def __init__(self, client: KunoClient):
+        self._client = client
+
+    def create(self, job: str | VideoJob | StandardVideoJob, expires_at: float | datetime | None = None) -> dict:
+        """Makes a link to one of this account's finished videos. Returns the owner's row plus `token`, `url_path` and
+        `url`, shown only now, and `key_included`. Given a private `VideoJob`, `url` carries its key as `#k=...`;
+        given a job id it can't, so add it with `share_url_with_key`.
+
+        `expires_at` is Unix seconds or a datetime (a naive one is local time), from a minute to ten years ahead;
+        None means until revoked."""
+        job_id = job if isinstance(job, str) else job.job_id
+        # Check the key before the link exists, so a bad key can't leave a link behind.
+        key = _output_key_text(job.output_key) if isinstance(job, VideoJob) else None
+        if isinstance(expires_at, datetime):
+            expires_at = expires_at.timestamp()
+        if expires_at is not None and (
+            isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at)
+        ):
+            raise KunoError(0, "invalid_expiry", ERROR_CODES["invalid_expiry"])
+        body = {"expires_at": None if expires_at is None else float(expires_at)}
+        link = self._client._request("POST", f"/v1/videos/{quote(job_id, safe='')}/shares", json=body).json()
+        link["key_included"] = False
+        if key is not None and link.get("privacy") == "private":
+            link["url"] = share_url_with_key(link["url"], key)
+            link["key_included"] = True
+        return link
+
+    def revoke(self, share_id: str) -> dict:
+        """Stops a link for good and returns its row, now `revoked`. Revoking twice is harmless."""
+        return self._client._request("DELETE", f"/v1/account/shares/{quote(share_id, safe='')}").json()
+
+    def get(self, token_or_url: str) -> dict:
+        """Public, no credential sent: what a link shows (`privacy`, `profile_id`, `created_at`, `shared_at`,
+        `expires_at`, `content_digest`, `receipt`, `signing_public_key`), plus its `token` and the fragment's `key`."""
+        token, key = parse_share_link(token_or_url)
+        details = self._client._request("GET", f"/v1/shares/{token}", auth=False).json()
+        return {**details, "token": token, "key": key}
+
+    def open(self, url: str, key: str | bytes | None = None) -> GenerationResult:
+        """Public, no credential sent: downloads a shared video and checks it against the enclave-signed receipt. A
+        private link needs its key, from the link's fragment or `key`; the video is decrypted here."""
+        details = self.get(url)
+        output_key = key if key is not None else details["key"]
+        private = details.get("privacy") == "private"
+        if private and not output_key:
+            raise KunoError(0, "missing_key", ERROR_CODES["missing_key"])
+        digest = details.get("content_digest")
+        try:
+            receipt = Receipt.model_validate(details.get("receipt"))
+        except ValueError:  # pydantic's ValidationError is a ValueError
+            raise KunoError(0, "integrity", "The link has no valid receipt to check the video against.") from None
+        if receipt.body.content_digest != digest:
+            raise KunoError(0, "integrity", "The link's receipt doesn't describe this video.")
+        data = self._client._request("GET", f"/v1/shares/{details['token']}/video", auth=False).content
+        profile_id = details.get("profile_id") or receipt.body.profile_id
+        if not private:
+            if sha256_hex(data) != digest:
+                raise KunoError(0, "integrity", "The shared video does not match its receipt.")
+            return GenerationResult(receipt.body.job_id, data, receipt, profile_id, privacy="standard")
+        if sha256_hex(data) != receipt.body.output_digest:
+            raise KunoError(0, "integrity", "The shared video does not match the enclave's receipt.")
+        if not _signed_by(receipt, details.get("signing_public_key")):
+            raise KunoError(0, "integrity", "The receipt was not signed by the enclave that made this video.")
+        try:
+            # The label binds the blob to the signed receipt's job: a blob sealed for another job doesn't open.
+            video = decrypt_blob(_output_key_bytes(output_key), output_label(receipt.body.job_id), data)
+        except (DecryptionError, ValueError):
+            raise KunoError(0, "decrypt_failed", "This video didn't open with the link's key.") from None
+        if sha256_hex(video) != digest:
+            raise KunoError(0, "integrity", "The decrypted video does not match the receipt.")
+        return GenerationResult(receipt.body.job_id, video, receipt, profile_id, privacy="private")
+
+    def list(self, job_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """This account's links, newest first, each with `status` (`active`, `revoked`, `expired`, `video_deleted`,
+        `video_removed`, `account_closed` or `unavailable`) and `view_count`. Tokens aren't kept, so they aren't here."""
+        params: dict[str, Any] = {"limit": limit}
+        if job_id:
+            params["job_id"] = job_id
+        return self._client._request("GET", "/v1/account/shares", params=params).json()
 
 
 def _wait(

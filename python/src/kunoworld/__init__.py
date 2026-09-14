@@ -21,9 +21,12 @@ from .client import (
     KunoClient,
     KunoError,
     PreparedJob,
+    ShareLinks,
     StandardVideoJob,
     VideoJob,
     infer_mode,
+    parse_share_link,
+    share_url_with_key,
 )
 
 __all__ = [
@@ -33,8 +36,11 @@ __all__ = [
     "KunoClient",
     "KunoError",
     "PreparedJob",
+    "ShareLinks",
     "StandardVideoJob",
     "VideoJob",
     "infer_mode",
+    "parse_share_link",
+    "share_url_with_key",
 ]
 __version__ = "0.1.0"

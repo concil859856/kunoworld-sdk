@@ -12,6 +12,11 @@ finished video locally.
 
 Neither package is published to npm or PyPI yet; each README says how to install from source.
 
+Both clients also make, list and revoke share links to your videos, and open links someone sent
+you. A private video's link carries its key in the `#k=` fragment, which never reaches KunoWorld;
+see "Share links" in each README. Key sync between devices and the `/v1/me/*` routes need the
+website's email sign-in, so the SDKs have no methods for them.
+
 **Development preview.** Real Intel TDX and NVIDIA evidence verification is not built yet, so
 today these clients talk to development gateways whose workers use simulated attestation and
 may return placeholder video. The encryption, receipts and verification code paths are the

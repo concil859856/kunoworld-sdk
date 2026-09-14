@@ -303,3 +303,70 @@ export interface Provenance {
     evidence: AttestationEvidence;
   };
 }
+
+/**
+ * Where a share link stands, from its owner's view. The public answer for anything but `active`
+ * is the same `410 share_unavailable`. `unavailable` covers a video that can't be played for any
+ * other reason (including a preservation hold) without saying which.
+ */
+export type ShareStatus = "active" | "revoked" | "expired" | "video_deleted" | "video_removed" | "account_closed" | "unavailable";
+
+/** One of this account's share links: `shares.list()` and `shares.revoke()`. The token is never here. */
+export interface ShareSummary {
+  shareId: string;
+  jobId: string;
+  privacy: PrivacyMode;
+  profileId: string | null;
+  /** Unix seconds. */
+  createdAt: number;
+  /** Unix seconds, or null for a link that works until revoked. */
+  expiresAt: number | null;
+  revokedAt: number | null;
+  status: ShareStatus;
+  viewCount: number;
+}
+
+/** A link just made by `shares.create()`. The token is shown only now; KunoWorld stores only its hash. */
+export interface ShareLink extends ShareSummary {
+  /** 32 random bytes, base64url (43 characters). Anyone holding it can watch the video. */
+  token: string;
+  /** `/s/<token>`, never with a key. */
+  urlPath: string;
+  /** The website's link. For a private video it carries the key as `#k=…` when `keyIncluded` is true. */
+  url: string;
+  /**
+   * Private links: whether `url` already carries the video's key. False when the link was made
+   * from a job id alone; add the key with `shareUrlWithKey(url, handle.outputKey)`. Always false
+   * for Standard links, which need no key.
+   */
+  keyIncluded: boolean;
+}
+
+/** What anyone holding a link learns, from `shares.get()`: nothing about the account. */
+export interface SharedVideoDetails {
+  privacy: PrivacyMode;
+  profileId: string;
+  /** When the video was made (Unix seconds). */
+  createdAt: number;
+  /** When the link was made (Unix seconds). */
+  sharedAt: number;
+  expiresAt: number | null;
+  /** SHA-256 of the video (the MP4), as in the receipt. */
+  contentDigest: string;
+  receipt: Receipt | null;
+  /** Base64url Ed25519 key of the enclave that signed the receipt. */
+  signingPublicKey: string | null;
+  /** The link's token. */
+  token: string;
+  /** The key from the link's `#k=` fragment, when the link had one. Never sent anywhere. */
+  key: string | null;
+}
+
+/** A shared video opened and checked by `shares.open()`. */
+export interface SharedVideo {
+  privacy: PrivacyMode;
+  video: Uint8Array;
+  receipt: Receipt;
+  contentDigest: string;
+  profileId: string;
+}

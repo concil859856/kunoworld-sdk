@@ -125,6 +125,13 @@ strikes_24h, strikes_7d }`.
 | `key_not_accepted` (422) | a report carried an `output_key` but its reason isn't `csam` or `sexual_minor` |
 | `content_not_reviewable` (403) | operator API: the item can't be opened (not a CSAM/sexual-minor report, no matching legal hold) |
 | `gone` (410) | a retired endpoint or credential, such as a `kwt_` studio token |
+| `share_unavailable` (410, or 409 when making one) | a share link stopped working, or this video can't be shared right now |
+| `too_many_shares` (409) | 20 working links per video, or 1000 per account; revoke some first |
+| `invalid_expiry` (422) | a share link's expiry isn't between a minute and ten years ahead |
+| `rate_limited` (429) | too many requests to public share links from this network; try again in a minute |
+| `missing_key` | a private share link had no `#k=` key, and none was passed |
+| `decrypt_failed` | a private video didn't open with the key given |
+| `invalid_key` | an output key isn't 32 bytes of base64url (checked before a link is made) |
 
 `ERROR_CODES` maps these codes to a sentence, `err.explanation` reads it for an error, and
 `err.isContentPolicy` is true for `content_policy` and `safety_blocked`.
@@ -144,6 +151,66 @@ Reports are sent without your API key. `reason` is one of `csam`, `sexual_minor`
 the video with `content_digest`, `job_id` or `url`. `output_key` is accepted only for `csam` and
 `sexual_minor` reports, for a private video you were given with its key: it lets a reviewer open
 that one video, and the view is logged.
+
+## Share links
+
+A share link lets anyone who has it watch one of your finished videos, without an account. There
+are no links until you make one, and each can be revoked or given an expiry.
+
+```js
+const link = await kuno.shares.create(job);       // a JobHandle or StandardJobHandle, or a job id
+console.log(link.url);                             // https://kunoworld.com/s/<token>#k=<key> for a private handle
+
+const weekLong = await kuno.shares.create(job, { expiresAt: new Date(Date.now() + 7 * 86400_000) });
+
+const links = await kuno.shares.list({ jobId: job.jobId });   // newest first, with status and viewCount
+await kuno.shares.revoke(links[0].shareId);
+```
+
+- **Anyone with the link can watch.** The token is 32 random bytes and KunoWorld stores only its
+  hash, so `create` is the only time you get `token`, `urlPath` and `url`; `list` can't show them
+  again.
+- **A private link carries the key in its fragment.** For a private video the gateway serves only
+  the sealed file. The video's output key goes after `#k=` in the link, and browsers never send
+  the fragment, so KunoWorld never receives the key. Given a `JobHandle`, `create` adds it
+  (`keyIncluded: true`). Given only a job id it can't: `keyIncluded` is false, and
+  `shareUrlWithKey(link.url, handle.outputKey)` adds it. `urlPath` never carries the key.
+- **A Standard link** has no key: the gateway serves the video itself.
+- **When a link stops working.** Once revoked; once past `expiresAt` (Unix seconds or a `Date`,
+  from a minute to ten years ahead; leave it out for a link that lasts until revoked); and
+  whenever the video is deleted, removed after review or can't be played for another reason, or
+  the account is closed. Viewers then get `410 share_unavailable`, the same answer in every case.
+  `list()` tells you which in `status`: `active`, `revoked`, `expired`, `video_deleted`,
+  `video_removed`, `account_closed` or `unavailable`. Revoking stops KunoWorld serving the video;
+  it can't take back a copy, or a private video's key, that someone already has.
+- **Limits.** 20 working links per video and 1000 per account (`too_many_shares`). Views are
+  counted (`viewCount`); nothing about a viewer is stored. The public routes are rate-limited
+  per network, 60 requests a minute by default (`rate_limited`); `open` makes two.
+
+Opening a link needs no account, and no API key is sent:
+
+```js
+const viewer = new KunoClient();                          // no apiKey
+const about = await viewer.shares.get(url);               // privacy, profileId, dates, receipt, and the fragment's key
+const { video, receipt } = await viewer.shares.open(url); // or open(linkWithoutKey, key)
+```
+
+`get` and `open` take a full link, a `/s/<token>` path or a bare token. Only the token is sent, to
+this client's `baseUrl`; the key never is. For a private link, `open` checks the sealed file
+against the receipt's `output_digest`, verifies the receipt's signature, decrypts the video here
+and checks its SHA-256 against `content_digest`; for a Standard link it checks the SHA-256. It
+throws `missing_key` when a private link has no key (nothing is downloaded), `decrypt_failed` for
+the wrong key and `integrity` when anything doesn't match. The signing key arrives from the
+gateway with the link, so the check proves the video matches a receipt signed by that key; for your
+own videos, `result(handle)` checks against the key you attested when you submitted.
+
+### Calls that need the website
+
+A few account features use the website's email sign-in and have no SDK methods: syncing private
+video keys between your devices (`/v1/me/keyvault/…`) and the website's own routes under
+`/v1/me/…`, such as `/v1/me/shares`. API keys get `401` there. Share links don't need them:
+`kuno.shares` uses the API-key routes (`/v1/videos/{id}/shares`, `/v1/account/shares`), which
+also accept a web session through a same-origin proxy (`KunoClient.forProxy`).
 
 ## Inputs and modes
 
@@ -209,6 +276,12 @@ A `kwt_` studio token is refused with `gone`.
 | `eligibility()` | private-mode eligibility, restriction and strike counts |
 | `report(request)` | report a video (no credential sent) |
 | `provenance(file)` / `provenanceByDigest(sha256)` | look up a film's public certificate by its hash |
+| `shares.create(handleOrJobId, { expiresAt }?)` | make a share link; `url` carries a private handle's key as `#k=…` |
+| `shares.list({ jobId, limit }?)` / `shares.revoke(shareId)` | your links with `status` and `viewCount`, or stop one |
+| `shares.get(link)` / `shares.open(link, key?)` | public (no credential): a link's details, or its video checked and decrypted |
+
+`shareUrlWithKey(url, outputKey)` adds a private video's key to a link, and `parseShareLink(link)`
+returns `{ token, key }`.
 
 Failures throw `KunoError` with the HTTP `status`, a machine-readable `code`, and the rest of the
 error body in `details` (with `reasons` and `restrictedUntil` getters). The package also exports
