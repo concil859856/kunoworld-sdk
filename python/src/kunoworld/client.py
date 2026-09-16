@@ -85,6 +85,11 @@ ERROR_CODES: dict[str, str] = {
     "too_many_shares": "Too many working share links: 20 per video and 1000 per account. Revoke some first.",
     "invalid_expiry": "A share link's expiry must be between a minute and ten years from now, in Unix seconds, or None.",
     "rate_limited": "Too many requests from this network to public share links. Try again in a minute.",
+    "over_budget": "The gateway's quote for this job is over max_price_usd, so nothing was uploaded, sealed or charged. "
+    "`details` has `price_usd` and `max_price_usd`.",
+    "invalid_budget": "max_price_usd must be a finite number, zero or more.",
+    "quote_mismatch": "The gateway quoted different params from the job about to be sent (routing changed in between), so "
+    "nothing was sent. Try again.",
 }
 
 
@@ -195,13 +200,72 @@ class GenerationResult:
 
 @dataclass
 class PreparedJob:
-    """A sealed request ready to POST. Keep `output_key` private: it is the only way to open the video."""
+    """A sealed request ready to POST. Keep `output_key` private: it is the only way to open the video. `quote` is the
+    gateway's quote for it when `max_price_usd` was given."""
 
     request: JobCreate
     output_key: bytes
     signing_public_key: bytes
     fallback_reason: str | None = None
     input_blob_bytes: list[bytes] = field(default_factory=list)
+    quote: Quote | None = None
+
+
+@dataclass(frozen=True)
+class PriceBreakdown:
+    """How the price was reached, in `ModelProfile.price_usd`'s order: `usd_per_second` × `billable_seconds` (a
+    storyboard's stitched seconds) × `fps_multiplier` × `long_clip_multiplier` (Private only, past `long_clip_over_s` of
+    the longest render) = `subtotal_usd`, and never less than `min_job_usd` (`minimum_applied`)."""
+
+    usd_per_second: float
+    billable_seconds: float
+    fps_multiplier: float
+    long_clip_multiplier: float
+    subtotal_usd: float
+    min_job_usd: float
+    minimum_applied: bool
+    long_clip_over_s: float | None = None
+
+
+@dataclass(frozen=True)
+class Quote:
+    """The gateway's exact price for a job (`POST /v1/quote`): what it would hold if the job were submitted now, for
+    `params` on `profile_id` (after any fallback, which `fallback_reason` names). `placeholder` is true while prices are
+    placeholders. `balance_usd` is the account's balance, or None when the key wasn't accepted."""
+
+    price_usd: float
+    privacy: Privacy
+    profile_id: str
+    params: GenerationParams
+    breakdown: PriceBreakdown
+    placeholder: bool
+    fallback_reason: str | None = None
+    requested_profile_id: str | None = None
+    profile_name: str = ""
+    balance_usd: float | None = None
+    currency: str = "USD"
+
+    @property
+    def balance_covers(self) -> bool | None:
+        """Whether the balance covers the price; None without a balance."""
+        return None if self.balance_usd is None else self.balance_usd >= self.price_usd
+
+    @classmethod
+    def from_json(cls, data: dict) -> Quote:
+        fields = PriceBreakdown.__dataclass_fields__
+        return cls(
+            price_usd=float(data["price_usd"]),
+            privacy=data["privacy"],
+            profile_id=data["profile_id"],
+            params=GenerationParams.model_validate(data["params"]),
+            breakdown=PriceBreakdown(**{k: v for k, v in data["breakdown"].items() if k in fields}),
+            placeholder=bool(data.get("placeholder", True)),
+            fallback_reason=data.get("fallback_reason"),
+            requested_profile_id=data.get("requested_profile_id"),
+            profile_name=data.get("profile_name") or "",
+            balance_usd=data.get("balance_usd"),
+            currency=data.get("currency", "USD"),
+        )
 
 
 class KunoClient:
@@ -388,6 +452,15 @@ class KunoClient:
         """This account's standard jobs, newest first."""
         return self._request("GET", "/v1/standard/videos", params={"limit": limit}).json()
 
+    def status(self, job_id: str) -> JobStatus:
+        """A job's status by id, in either mode: `status`, `stage` (a storyboard's `shot i/N` while it renders), `progress`,
+        `price_usd` and, once it succeeds, the receipt. Opening a private video still needs its `VideoJob`."""
+        return JobStatus.model_validate(self._request("GET", f"/v1/videos/{quote(job_id, safe='')}").json())
+
+    def cancel(self, job_id: str) -> JobStatus:
+        """Cancels a job still queued or running, in either mode; its price is refunded. A finished job is unchanged."""
+        return JobStatus.model_validate(self._request("POST", f"/v1/videos/{quote(job_id, safe='')}/cancel").json())
+
     def delete(self, job_id: str) -> None:
         """Deletes a job's stored content, in either mode: a private job's sealed files, or a standard
         job's video, prompt, inputs and preview. Videos are kept until their owner deletes them; the
@@ -434,6 +507,7 @@ class KunoClient:
         wait: bool = True,
         timeout: float = 1800.0,
         on_progress: ProgressFn | None = None,
+        max_price_usd: float | None = None,
     ) -> GenerationResult | VideoJob | StandardVideoJob:
         """`privacy="private"` (default) encrypts on this machine to an attested confidential enclave.
         `privacy="standard"` sends the prompt and inputs to KunoWorld readable: KunoWorld and the
@@ -441,9 +515,13 @@ class KunoClient:
 
         With `shots`, the job is a storyboard (mode `storyboard`): one video stitched from the shots in order, and
         `prompt` is the scene they share (characters, place, style), which may be empty. Its `duration_s` is computed
-        from the shots (`kuno_protocol.profiles.storyboard_duration_s`), so leave `duration_s` unset; it takes no inputs."""
+        from the shots (`kuno_protocol.profiles.storyboard_duration_s`), so leave `duration_s` unset; it takes no inputs.
+
+        With `max_price_usd`, the gateway quotes the exact params about to be sent (`POST /v1/quote`), and a price over it
+        raises `over_budget` before any input is uploaded or anything is sealed or charged."""
         if privacy not in ("private", "standard"):
             raise KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".')
+        _check_budget(max_price_usd)
         inputs: list[Input] = []
         if first_frame is not None:
             inputs.append(Input.load(InputRole.FIRST_FRAME, first_frame))
@@ -474,6 +552,7 @@ class KunoClient:
                 seed=seed,
                 negative_prompt=negative_prompt,
                 options=options,
+                max_price_usd=max_price_usd,
             )
             return standard.wait(timeout=timeout, on_progress=on_progress) if wait else standard
 
@@ -492,6 +571,7 @@ class KunoClient:
             seed=seed,
             negative_prompt=negative_prompt,
             options=options,
+            max_price_usd=max_price_usd,
         )
         job = self.submit(prepared)
         return job.wait(timeout=timeout, on_progress=on_progress) if wait else job
@@ -513,9 +593,12 @@ class KunoClient:
         negative_prompt: str | None = None,
         options: dict[str, Any] | None = None,
         shots: Iterable[Shot] | None = None,
+        max_price_usd: float | None = None,
     ) -> PreparedJob:
         """Routes, verifies the enclave, encrypts and uploads inputs, and seals the request. With `shots`, a storyboard:
-        the shot prompts are sealed with the scene (`SealedPayload.shots`)."""
+        the shot prompts are sealed with the scene (`SealedPayload.shots`). With `max_price_usd`, `over_budget` when the
+        gateway's quote for these params is over it, before the enclave is picked or anything is uploaded or sealed."""
+        _check_budget(max_price_usd)
         inputs = inputs or []
         shots = _check_storyboard(shots, inputs, mode, duration_s)
         mode = Mode.STORYBOARD if shots is not None else (mode or infer_mode(i.role for i in inputs))
@@ -526,6 +609,7 @@ class KunoClient:
         profile = self.profile(route.profile_id)
         params = _fit_params(profile, mode, inputs, duration_s, resolution, aspect_ratio, fps, audio, route.fallback_reason, shots=shots)
         _check_shot_prompts(profile, prompt, shots)
+        priced = self._within_budget(params, "private", max_price_usd)
         enclave = self._pick_enclave(self._fitting_route(route, params))
 
         job_id = str(uuid.uuid4())
@@ -572,6 +656,7 @@ class KunoClient:
             signing_public_key=b64d(enclave["signing_public_key"]),
             fallback_reason=route.fallback_reason,
             input_blob_bytes=blob_bytes,
+            quote=priced,
         )
 
     def submit_standard(
@@ -592,9 +677,12 @@ class KunoClient:
         options: dict[str, Any] | None = None,
         webhook_url: str | None = None,
         shots: Iterable[Shot] | None = None,
+        max_price_usd: float | None = None,
     ) -> StandardVideoJob:
         """Standard mode: uploads the inputs as they are and lets the gateway seal the job to a miner. With `shots`, a
-        storyboard: the shot prompts go in the body's `shots`, next to the scene in `prompt`."""
+        storyboard: the shot prompts go in the body's `shots`, next to the scene in `prompt`. With `max_price_usd`,
+        `over_budget` when the gateway's quote for these params is over it, before any input is uploaded."""
+        _check_budget(max_price_usd)
         inputs = inputs or []
         shots = _check_storyboard(shots, inputs, mode, duration_s)
         mode = Mode.STORYBOARD if shots is not None else (mode or infer_mode(i.role for i in inputs))
@@ -605,6 +693,7 @@ class KunoClient:
         profile = self.profile(route.profile_id)
         params = _fit_params(profile, mode, inputs, duration_s, resolution, aspect_ratio, fps, audio, route.fallback_reason, shots=shots)
         _check_shot_prompts(profile, prompt, shots)
+        self._within_budget(params, "standard", max_price_usd)
         refs = []
         for index, item in enumerate(inputs):
             upload = self.upload_standard(item.role, item.data, item.mime)
@@ -667,6 +756,78 @@ class KunoClient:
             raise KunoError(0, "privacy_mode_unavailable", str(exc)) from None
         except ParamError as exc:
             raise KunoError(0, "invalid_params", str(exc)) from None
+
+    def quote(
+        self,
+        model: str | None = None,
+        *,
+        family: str | None = None,
+        mode: Mode | str | None = None,
+        duration_s: float | None = None,
+        shots: Iterable[Shot | ShotSpec] | None = None,
+        resolution: str | None = None,
+        aspect_ratio: str | None = None,
+        fps: int | None = None,
+        audio: bool = True,
+        input_roles: Iterable[InputRole | str] | None = None,
+        privacy: Privacy = "private",
+    ) -> Quote:
+        """The gateway's exact price for a job shaped like this (`POST /v1/quote`): what it would hold if the job were
+        submitted now, after routing (fallbacks, regions, capacity) and the defaults `generate` fills in. Takes
+        `generate`'s job-shape arguments and no prompt; `input_roles` stands for the inputs (none by default: the mode
+        comes from them as `generate` infers it, or pass `mode`). `shots` are `Shot`s, whose prompts are never sent, or
+        `ShotSpec`s. Refusals raise the code the job itself would get (`invalid_params`, `privacy_mode_unavailable`,
+        `region_restricted`, `no_capacity`, `private_mode_not_eligible`...)."""
+        if privacy not in ("private", "standard"):
+            raise KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".')
+        roles = [InputRole(role) for role in input_roles] if input_roles is not None else None
+        shot_list = _check_storyboard(shots, [], mode, duration_s, require_prompts=False)
+        if shot_list is not None and roles:
+            raise KunoError(0, "invalid_inputs", "Storyboards take no inputs.")
+        if shot_list is not None:
+            mode = Mode.STORYBOARD
+        elif mode is None and roles is not None:
+            mode = infer_mode(roles)
+        body: dict[str, Any] = {"privacy": privacy, "audio": audio}
+        for key, value in (
+            ("profile_id", model), ("family", family), ("mode", Mode(mode).value if mode is not None else None),
+            ("duration_s", duration_s), ("resolution", resolution), ("aspect_ratio", aspect_ratio), ("fps", fps),
+        ):
+            if value is not None:
+                body[key] = value
+        if roles is not None:
+            body["input_roles"] = [role.value for role in roles]
+        if shot_list is not None:
+            # Each shot's length and join only: prompts stay here.
+            body["shots"] = [{"duration_s": shot.duration_s, "join": shot.join} for shot in shot_list]
+        return Quote.from_json(self._request("POST", "/v1/quote", json=body).json())
+
+    def _within_budget(self, params: GenerationParams, privacy: Privacy, max_price_usd: float | None) -> Quote | None:
+        """With `max_price_usd`, the gateway's quote for exactly these params, refusing `over_budget` when its price is
+        over it. Every field is sent, on the routed profile, so the gateway fills nothing in and prices the job as sent."""
+        if max_price_usd is None:
+            return None
+        body = {
+            "profile_id": params.profile_id, "mode": params.mode.value, "privacy": privacy, "resolution": params.resolution,
+            "aspect_ratio": params.aspect_ratio, "fps": params.fps, "audio": params.audio,
+            "input_roles": [role.value for role in params.input_roles],
+        }
+        if params.shots is not None:
+            body["shots"] = [shot.model_dump(mode="json") for shot in params.shots]
+        else:
+            body["duration_s"] = params.duration_s
+        # `priced`, not `quote`: this module's `quote` is urllib's.
+        priced = Quote.from_json(self._request("POST", "/v1/quote", json=body).json())
+        if priced.params != params:
+            raise KunoError(0, "quote_mismatch", ERROR_CODES["quote_mismatch"], {"quote": priced.params.model_dump(mode="json")})
+        if priced.price_usd > max_price_usd:
+            raise KunoError(
+                0, "over_budget",
+                f"This video costs ${priced.price_usd:g} ({priced.profile_name or priced.profile_id}, {privacy}), over the "
+                f"${max_price_usd:g} limit. Nothing was uploaded, sealed or charged.",
+                {"price_usd": priced.price_usd, "max_price_usd": max_price_usd, "profile_id": priced.profile_id},
+            )
+        return priced
 
     @staticmethod
     def _fitting_route(route: RouteResponse, params: GenerationParams) -> RouteResponse:
@@ -1029,10 +1190,18 @@ def _fit_params(
     )
 
 
+def _check_budget(max_price_usd: float | None) -> None:
+    if max_price_usd is None:
+        return
+    if isinstance(max_price_usd, bool) or not isinstance(max_price_usd, (int, float)) or not math.isfinite(max_price_usd) or max_price_usd < 0:
+        raise KunoError(0, "invalid_budget", ERROR_CODES["invalid_budget"])
+
+
 def _check_storyboard(
-    shots: Iterable[Shot] | None, inputs: list[Input], mode: Mode | str | None, duration_s: float | None
+    shots: Iterable[Shot] | None, inputs: list[Input], mode: Mode | str | None, duration_s: float | None, require_prompts: bool = True
 ) -> list[Shot] | None:
-    """The storyboard's shots as a list, after the checks that need no profile; None for any other job."""
+    """The storyboard's shots as a list, after the checks that need no profile; None for any other job. A quote passes
+    `require_prompts=False`: it takes `ShotSpec`s too, and never sends a prompt."""
     if shots is None:
         if mode is not None and Mode(mode) is Mode.STORYBOARD:
             raise KunoError(0, "invalid_shots", "A storyboard needs its shots: pass shots=[Shot(...), ...].")
@@ -1045,10 +1214,14 @@ def _check_storyboard(
     if duration_s is not None:
         raise KunoError(0, "invalid_params", "A storyboard's length comes from its shots: leave duration_s unset.")
     for number, shot in enumerate(shots, start=1):
+        if not require_prompts and isinstance(shot, ShotSpec):
+            continue
         if not isinstance(shot, Shot):
             raise KunoError(0, "invalid_shots", f"Shot {number} is not a Shot.")
-        if not isinstance(shot.prompt, str) or not shot.prompt.strip():
+        if require_prompts and (not isinstance(shot.prompt, str) or not shot.prompt.strip()):
             raise KunoError(0, "invalid_shots", f"Shot {number} needs a prompt.")
+        if not require_prompts and shot.join not in (None, "fresh", "continue", "cut"):
+            raise KunoError(0, "invalid_shots", f'Shot {number}\'s join is "fresh", "continue" or "cut".')
     return shots
 
 

@@ -12,6 +12,13 @@ finished video locally.
 
 Neither package is published to npm or PyPI yet; each README says how to install from source.
 
+**For AI agents.** The Python package includes `kunoworld-mcp`, a local MCP server for assistants such as Claude Code,
+Claude Desktop and Cursor (`python/README.md`, "Agents (MCP)"). It runs on the user's computer, so Private jobs are still
+encrypted and decrypted there; the assistant itself sees what the user types and what the tools return. Its tools quote
+the exact price of a job (`POST /v1/quote`) before spending. [skills/kunoworld-video](skills/kunoworld-video/SKILL.md) is
+an Agent Skill that teaches an assistant to quote first, choose Private or Standard, write LTX-2.5 and MiniMax H3
+prompts, and plan storyboards.
+
 Both clients also make, list and revoke share links to your videos, and open links someone sent
 you. A private video's link carries its key in the `#k=` fragment, which never reaches KunoWorld;
 see "Share links" in each README. Key sync between devices and the `/v1/me/*` routes need the

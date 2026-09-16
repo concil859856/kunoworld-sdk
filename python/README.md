@@ -109,6 +109,9 @@ operator credit, no active restriction and fewer than 2 blocked jobs in 30 days.
 | `unsupported_media` (422) | the gateway didn't recognize an upload's type (it reads the bytes, not the content-type) |
 | `content_policy` (422) | a standard job breaks the content policy (all NSFW is banned); not created, nothing charged |
 | `invalid_params` (422, or before sending) | the request doesn't fit the model's limits, including a storyboard's shots and stitched length |
+| `over_budget` (before sending) | the gateway's quote is over `max_price_usd`; nothing was uploaded, sealed or charged. `err.details` has `price_usd` and `max_price_usd` |
+| `invalid_budget` (before sending) | `max_price_usd` isn't an amount of zero or more |
+| `quote_mismatch` (before sending) | the gateway quoted other params than the job about to be sent (routing changed in between); try again |
 | `invalid_shots` (422, or before sending) | a storyboard without one non-empty prompt per shot, or `shots` on a job that isn't a storyboard |
 | `prompt_too_long` (422, or before sending) | a prompt, or a storyboard's scene and one shot's prompt together, is over the model's limit |
 | `safety_blocked` | the in-enclave content check stopped the job; it counts as a strike |
@@ -270,11 +273,51 @@ result.save("harbor.mp4")
   them wherever it returns the prompt (`standard_videos()`).
 - **Routing.** Shots render one at a time, so the client asks `/v1/route` for the longest shot (`duration_s`) and picks a
   worker that fits it, however long the stitched video is.
-- **Price.** You pay the model's per-second rate for the stitched seconds. `kuno.estimate_price("ltx-2.5-fast",
-  shots=[...], resolution="720p", privacy="private")` computes it from the published prices; the charge when the job
-  is accepted is what counts. Three 5 s shots with two joins are 13.708 s: $1.645 Private at 720p.
+- **Price.** You pay the model's per-second rate for the stitched seconds. `kuno.quote("ltx-2.5-fast", shots=[...],
+  resolution="720p")` asks the gateway for the exact price ([Prices, quotes and budgets](#prices-quotes-and-budgets));
+  `kuno.estimate_price(...)`, with the same arguments, computes it locally from the published prices. Three 5 s shots
+  with two joins are 13.708 s: $1.645 Private at 720p.
 - **Seeds.** Shot *i* (from 0) renders with seed `(seed + i) mod 2^31`.
 - **Not verified yet.** Storyboards carry no step commitment, so validators don't step-audit them.
+
+## Prices, quotes and budgets
+
+`kuno.quote(...)` asks the gateway for the exact price of a job before anything is encrypted or sent
+(`POST /v1/quote`). It takes `generate`'s job-shape arguments and no prompt, routes the request as the job would be
+routed (fallbacks, licence regions, capacity), fills in the same defaults, and prices those params with the function
+that charges the job.
+
+```python
+from kunoworld import Shot
+
+quote = kuno.quote("ltx-2.5-fast", shots=[Shot("", 5), Shot("", 5), Shot("", 5, join="cut")], resolution="720p")
+print(quote.price_usd, quote.profile_id, quote.fallback_reason)   # 1.645 ltx-2.5-fast None
+print(quote.breakdown)      # usd_per_second, billable_seconds (stitched), fps and long-clip multipliers, minimum
+print(quote.params)         # the GenerationParams priced
+print(quote.balance_usd, quote.balance_covers, quote.placeholder)
+```
+
+- **What it takes.** `model`, `family`, `mode`, `duration_s`, `shots` (`Shot`s, whose prompts are never sent, or
+  `ShotSpec`s), `resolution`, `aspect_ratio`, `fps`, `audio`, `privacy`, and `input_roles` for the inputs the job will
+  send. The mode follows from those roles as `generate` infers it; without any, the inputs the mode needs are assumed.
+- **Refusals** carry the code the job itself would get: `invalid_params`, `invalid_shots`, `privacy_mode_unavailable`,
+  `region_restricted`, `model_disabled`, `no_capacity` (with `max_duration_s` when no worker's hardware fits),
+  `private_mode_not_eligible` and `account_restricted`.
+- **A quote holds nothing.** The price is taken when the job is accepted. If routing or prices change in between, the
+  job is priced again the same way. `estimate_price` computes a price locally from `/v1/models`, without routing.
+
+**Budgets.** Pass `max_price_usd` to `generate`, `prepare` or `submit_standard`. After routing and filling in the params,
+the client has the gateway quote exactly those params, and raises `over_budget` when the price is over the limit:
+nothing is uploaded, sealed, submitted or charged, and `err.details` has `price_usd` and `max_price_usd`. A price equal
+to the limit goes ahead; `prepared.quote` keeps the quote.
+
+```python
+try:
+    job = kuno.generate(prompt, model="ltx-2.5-fast", duration_s=10, max_price_usd=1.00, wait=False)
+except KunoError as err:
+    if err.code == "over_budget":
+        print(f"It would cost ${err.details['price_usd']}")
+```
 
 ## Routing and fallbacks
 
@@ -297,9 +340,123 @@ job = VideoJob.restore(kuno, saved)
 result = job.wait(timeout=1800, on_progress=lambda status: print(status.status))
 ```
 
-`job.status()` and `job.cancel()` are there too. Stopping `wait` does not cancel a job. For
-full control, `kuno.prepare(...)` builds and encrypts a request without sending it, and
-`kuno.submit(prepared)` sends it.
+`job.status()` and `job.cancel()` are there too, and `kuno.status(job_id)` and `kuno.cancel(job_id)` work with the id
+alone, in either mode. Stopping `wait` does not cancel a job. For full control, `kuno.prepare(...)` builds and encrypts a
+request without sending it, and `kuno.submit(prepared)` sends it.
+
+## Agents (MCP)
+
+`kunoworld-mcp` is a local [MCP](https://modelcontextprotocol.io) server for AI assistants such as Claude Code, Claude
+Desktop and Cursor. It runs on your computer and talks to the assistant over stdio, so Private mode works as it does in
+your own program: the prompt, shots and images are encrypted here, to an attested confidential GPU, and videos are
+decrypted here. KunoWorld runs no hosted MCP server, because a hosted server would receive prompts readable.
+
+**What the assistant can see.** Private mode keeps the prompt and the video from KunoWorld and the GPU provider. It
+doesn't keep them from the assistant: the assistant, and whoever provides it, see whatever you type into the
+conversation and whatever the tools return (job ids, prices, settings, file paths and receipt digests; never a video's
+bytes or its key). The tool descriptions say so too.
+
+### Install
+
+The server is in the `mcp` extra, built on the official MCP Python SDK (1.x, FastMCP):
+
+```bash
+uv pip install -e /path/to/kunoworld-subnet/protocol -e '/path/to/kunoworld-sdk/python[mcp]'
+```
+
+In the KunoWorld development workspace, `uv sync` installs it as `.venv/bin/kunoworld-mcp`. `uvx` runs it without
+installing, from source until the packages are on PyPI:
+
+```bash
+uvx --with /path/to/kunoworld-subnet/protocol --from '/path/to/kunoworld-sdk/python[mcp]' kunoworld-mcp
+```
+
+### Add it to your assistant
+
+Claude Code:
+
+```bash
+claude mcp add --transport stdio kunoworld --env KUNOWORLD_API_KEY=kw_live_... --env KUNOWORLD_MAX_JOB_USD=5 -- \
+  uvx --with /path/to/kunoworld-subnet/protocol --from '/path/to/kunoworld-sdk/python[mcp]' kunoworld-mcp
+```
+
+Claude Code's project file `.mcp.json`, Claude Desktop's `claude_desktop_config.json` (Settings, Developer, Edit Config)
+and Cursor's `~/.cursor/mcp.json` (or `.cursor/mcp.json` in a project) take the same entry:
+
+```json
+{
+  "mcpServers": {
+    "kunoworld": {
+      "command": "uvx",
+      "args": ["--with", "/path/to/kunoworld-subnet/protocol", "--from", "/path/to/kunoworld-sdk/python[mcp]", "kunoworld-mcp"],
+      "env": {
+        "KUNOWORLD_API_KEY": "kw_live_...",
+        "KUNOWORLD_MAX_JOB_USD": "5",
+        "KUNOWORLD_OWNER_PUBLIC_KEY": "<the subnet owner's Ed25519 public key, base64>"
+      }
+    }
+  }
+}
+```
+
+- With the script installed, use `"command": "/path/to/.venv/bin/kunoworld-mcp"` and no `args`. Once the packages are
+  published, `"args": ["--from", "kunoworld[mcp]", "kunoworld-mcp"]` will do.
+- Desktop apps may not see your shell's `PATH`. If the server doesn't start, give `uvx` as a full path (`which uvx`).
+- Don't commit an API key in a project's `.mcp.json`. Claude Code expands `${KUNOWORLD_API_KEY}` there from your
+  environment.
+
+### Configuration
+
+| Variable | Default | What it sets |
+|---|---|---|
+| `KUNOWORLD_API_KEY` | none | an API key from your account page. Without one, only `list_models` works |
+| `KUNOWORLD_API_URL` | `https://api.kunoworld.com` | the gateway |
+| `KUNOWORLD_PRIVACY` | `private` | the mode a job gets when the assistant doesn't choose one |
+| `KUNOWORLD_MAX_JOB_USD` | none | a hard cap on every job's price. The assistant's `max_price_usd` can only lower it. Without the cap, every `generate_video` call needs `max_price_usd` |
+| `KUNOWORLD_OUTPUT_DIR` | `~/KunoWorld` | where videos and their receipts are saved |
+| `KUNOWORLD_JOBS_DIR` | `~/.kunoworld/jobs` | where job handles are kept |
+| `KUNOWORLD_OWNER_PUBLIC_KEY`, `KUNOWORLD_MANIFEST` | none | check workers against the manifest the subnet owner signed, or against a pinned manifest file, instead of trusting the gateway's copy ([Generate a video](#generate-a-video)) |
+| `KUNOWORLD_COUNTRY` | none | development gateways only: the country routing assumes |
+
+### Tools
+
+| Tool | What it does |
+|---|---|
+| `list_models` | models with their modes, durations, sizes, frame rates, storyboard limits, availability and prices per second in both modes |
+| `quote_price` | the exact price of a job, the model that would serve it, the settings priced and a breakdown. The same arguments as `generate_video`, without the prompt; shot prompts aren't sent |
+| `generate_video` | quotes, refuses over budget (`max_price_usd`, `KUNOWORLD_MAX_JOB_USD`), then submits and returns the job id; with `wait=true`, waits with progress notifications and saves the video. Takes the prompt, model or family, mode, duration, resolution, aspect ratio, fps, audio, seed, privacy, first-frame, last-frame and reference-image paths, and `shots` for a storyboard |
+| `get_job` | status, stage (`shot 3/8` while a storyboard renders), progress, price and any error |
+| `download_video` | checks the video against its signed receipt, decrypts a Private video here, and saves it with its receipt; returns the path, size, SHA-256 and a receipt summary |
+| `cancel_job` | cancels an unfinished job, which is refunded |
+| `list_jobs` | the jobs this server started, newest first |
+
+Errors come back as text that starts with the code, such as `over_budget: This video would cost $3.3 (LTX-2.5 Pro,
+private), over the $3 limit set by KUNOWORLD_MAX_JOB_USD. ...` or `private_mode_not_eligible: ... (reasons:
+no_verified_payment; ...)`.
+
+The `kunoworld-video` skill (`sdk/skills/kunoworld-video` in the SDK repository) teaches an assistant when to use
+KunoWorld, how to write prompts for LTX-2.5 and MiniMax H3, and how to plan storyboards.
+
+### Keys, logs and files
+
+- **Job handles stay on this computer.** A Private job's handle holds its output key, the only thing that opens the
+  video. The server writes it to `KUNOWORLD_JOBS_DIR/<job_id>.json` before sending the job, in a directory only you can
+  open (0700), readable only by you (0600). Handles go nowhere else, and no tool returns a key. Back the directory up
+  and guard it like a password: KunoWorld can't recover a lost key.
+- **No prompt is stored or logged.** A handle keeps the job's settings, price and status, not its prompt or shots. The
+  server logs only warnings, to stderr, and none carries a prompt or a key.
+- **Videos** are saved readable only by you (0600), as `kunoworld-<job_id>.mp4` or a name the assistant gives, next to
+  `<name>.receipt.json`. A different file already there is never overwritten.
+- **Attestation.** Without `KUNOWORLD_OWNER_PUBLIC_KEY` or `KUNOWORLD_MANIFEST`, workers are checked against the manifest
+  the gateway serves. `generate_video` says which one a Private job was checked against.
+
+### On a development network
+
+In the KunoWorld workspace, `KUNO_MINER_COUNTRY=JP scripts/dev.sh` starts a gateway on port 8080 and a mock worker
+(the gateway refuses a worker that offers MiniMax H3 from an unknown country). Point the server at it with
+`KUNOWORLD_API_URL=http://127.0.0.1:8080`, `KUNOWORLD_API_KEY` set to `KUNO_DEV_API_KEY` from `data/dev.env`,
+`KUNOWORLD_MANIFEST` set to the absolute path of `data/manifest.json`, and `KUNOWORLD_COUNTRY=JP`, the country a
+development gateway routes for (MiniMax H3 is licensed there). Mock workers return placeholder video.
 
 ## Client reference
 
@@ -313,8 +470,10 @@ NVIDIA rotates it; `country` is for development gateways only. Call `close()` wh
 | `models()` / `profile(profile_id)` | model profiles, availability and the switch |
 | `manifest()` | the golden manifest in use |
 | `route(mode, model=None, family=None, privacy="private", *, resolution=None, aspect_ratio=None, fps=None, duration_s=None)` | which profile and enclaves would serve a request; the size, frame rate and duration list only workers whose hardware can fit them (their serving envelope). `generate`, `prepare` and `submit_standard` send the request's own |
-| `generate(prompt, ..., shots=None, privacy="private")` | private: route, verify, encrypt, submit; standard: upload, create. Waits by default. With `shots`, a storyboard |
-| `estimate_price(model, *, duration_s=None, shots=None, resolution=None, aspect_ratio=None, fps=None, privacy="private")` | what such a job would cost, from the published prices; a storyboard's stitched seconds |
+| `generate(prompt, ..., shots=None, privacy="private", max_price_usd=None)` | private: route, verify, encrypt, submit; standard: upload, create. Waits by default. With `shots`, a storyboard; with `max_price_usd`, `over_budget` before anything is sent when the quote is over it |
+| `quote(model=None, *, family=None, mode=None, duration_s=None, shots=None, resolution=None, aspect_ratio=None, fps=None, audio=True, input_roles=None, privacy="private")` | the gateway's exact price for such a job now, as a `Quote`: `price_usd`, `profile_id`, `fallback_reason`, `params`, `breakdown`, `placeholder`, `balance_usd` |
+| `estimate_price(model, *, duration_s=None, shots=None, resolution=None, aspect_ratio=None, fps=None, privacy="private")` | what such a job would cost, computed locally from the published prices; a storyboard's stitched seconds |
+| `status(job_id)` / `cancel(job_id)` | a job's `JobStatus`, or cancel it (refunded), in either mode |
 | `prepare(...)` / `submit(prepared)` | the private path, in two steps |
 | `submit_standard(prompt, ...)` / `upload_standard(role, data, mime)` | the standard path, in pieces |
 | `delete(job_id)` | delete a job's stored content, in either mode |
