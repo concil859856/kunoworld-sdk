@@ -209,7 +209,8 @@ own videos, `result(handle)` checks against the key you attested when you submit
 
 A few account features use the website's email sign-in and have no SDK methods: syncing private
 video keys between your devices (`/v1/me/keyvault/…`) and the website's own routes under
-`/v1/me/…`, such as `/v1/me/shares`. API keys get `401` there. Share links don't need them:
+`/v1/me/…`, such as `/v1/me/shares`. API keys get `401` there. Elements need key sync set up on the
+website, but `kuno.elements` itself works with an API key and an Elements key. Share links don't need them:
 `kuno.shares` uses the API-key routes (`/v1/videos/{id}/shares`, `/v1/account/shares`), which
 also accept a web session through a same-origin proxy (`KunoClient.forProxy`).
 
@@ -287,6 +288,78 @@ const { video } = await kuno.wait(job, {
 
 `params.shots` exists only on storyboards, so every other job's encrypted request is byte-for-byte what it was.
 
+## Elements: reusable characters, products, locations and voices
+
+An Element is a named character, product, location, style or voice you reuse across videos: 1 to 4 images (or one
+voice clip), a short description the prompt can use ("Mara: a woman in her 60s with short silver hair and a green
+raincoat"), and, for a real person, a consent record. **Everything about it is encrypted in this process** before it
+reaches KunoWorld, which stores only ciphertext and can't open it.
+
+**The rules.** No public figures and no one under 18. A real person must be you, or must have given you permission,
+and their consent record says who, when and for what. Sexual content is banned, as everywhere on KunoWorld. Every write
+affirms these rules (`affirmRules: true`), and the gateway refuses a write without it.
+
+**The key.** Elements are encrypted with an *Elements key*, derived from the key sync master key the website holds, so
+your other devices open them once key sync is unlocked there. A program gets the key as text from the studio's Elements
+page and keeps it with its other secrets:
+
+```js
+import { KunoClient, parseElementsKey } from "@kunoworld/sdk";
+
+const kuno = new KunoClient({ apiKey: process.env.KUNO_API_KEY });
+const key = parseElementsKey(process.env.KUNO_ELEMENTS_KEY);   // "kwek1.<account id>.<key id>.<key>"
+
+const mara = await kuno.elements.create(key, {
+  kind: "character",                                   // character | product | location | style | voice
+  name: "Mara",
+  description: "a woman in her 60s with short silver hair and a green raincoat",
+  consent: { subject: "Mara Jones", relationship: "permission", grantedOn: "2026-09-01",
+             use: "Videos made on KunoWorld", affirmedAt: Math.floor(Date.now() / 1000) },
+  files: [{ data: portraitBytes, mime: "image/jpeg" }],
+}, { affirmRules: true });
+
+const { elements, unreadable } = await kuno.elements.list(key);
+```
+
+The Elements key opens Elements only: it is HKDF-SHA256 of the master key, which it can't be turned back into, so it
+opens no video key. **Rotating key sync replaces it**: writes with the old one fail with `vault_changed`, and
+`list` reports Elements it can't open in `unreadable` (`key_rotated`). Get the new key from the studio.
+
+**Using one in a video.** `attach` opens the Element's files here and returns an ordinary request: the files become
+inputs in the roles you choose, and each Element's description is added to the prompt on its own line. A Private job
+then seals them to the enclave like any input; a Standard job uploads them readable, so KunoWorld and the GPU provider
+can see them.
+
+```js
+const request = await kuno.elements.attach(
+  { prompt: "She walks along the pier at dusk.", model: "ltx-2.5-fast" },
+  [{ element: mara, role: "first_frame" }],             // file: 0 by default; a keyframe takes timeS
+);
+const job = await kuno.submit(request);
+```
+
+- **Which roles.** `elementRoles(element, profile)` lists what an Element's files can be on a model: images as
+  `first_frame`, `last_frame` or `keyframe` on LTX-2.5, or `reference_image` on MiniMax H3 Director
+  (`file: "all"` adds every image); a voice as `reference_audio` on MiniMax H3 Director (`h3-reference`) only. H3 is licensed only in
+  some regions (`available_in_region` on `models()`); elsewhere a voice is stored for later and its description still
+  works. Leave `role` out to use only the description.
+- **Storyboards** take descriptions only, added to the scene: their shots take no inputs.
+- **Withdrawn consent.** Set `consent.withdrawnAt` with `update`; `attach` then refuses the Element
+  (`consent_withdrawn`). Deleting it removes it for good.
+
+`update(key, element, draft)` without `files` keeps the files and their key; with `files` it replaces all of them under
+a new key. It names the revision it read, so a change from another device in between fails with `element_changed`.
+`delete(elementId)` removes the record and files. `file(element, position)` downloads and opens one file, checking it
+against the digest in the record.
+
+**Limits.** 200 Elements and 2 GiB per account; 4 images or one voice clip (up to 30 seconds) each; 15 MB per file; a
+name of 80 characters and a description of 1,000. 60 changes a minute. `elementDraftProblems(draft)` returns the
+problems with a draft as sentences before anything is sent.
+
+**What KunoWorld sees.** That the account has Elements, their random ids, revisions and times, how many files each has,
+their padded sizes, and when they are downloaded. Not their kind, name, description, consent record or pictures. The
+formats are in `platform/gateway/ELEMENTS.md`.
+
 ## Routing and fallbacks
 
 Before submitting, the client asks the gateway which model will serve the request. The owner's
@@ -345,9 +418,17 @@ Verification options:
 | `shares.create(handleOrJobId, { expiresAt }?)` | make a share link; `url` carries a private handle's key as `#k=…` |
 | `shares.list({ jobId, limit }?)` / `shares.revoke(shareId)` | your links with `status` and `viewCount`, or stop one |
 | `shares.get(link)` / `shares.open(link, key?)` | public (no credential): a link's details, or its video checked and decrypted |
+| `elements.create(key, draft, { affirmRules: true, elementId? })` | seal and store a new Element |
+| `elements.list(key)` / `elements.get(key, elementId)` / `elements.rows()` | open your Elements (`unreadable` lists any this key can't), one Element, or the stored ciphertext |
+| `elements.update(key, element, draft, { affirmRules: true })` / `elements.delete(elementId)` | replace an Element (keeping its files when `draft.files` is left out), or delete it |
+| `elements.file(element, position?)` / `elements.attach(request, uses)` | one opened file, or a request with Elements' files as inputs and their descriptions in the prompt |
 
 `shareUrlWithKey(url, outputKey)` adds a private video's key to a link, and `parseShareLink(link)`
 returns `{ token, key }`.
+
+Element helpers: `deriveElementsKey`, `parseElementsKey` / `formatElementsKey`, `elementRoles`, `elementPromptLine`,
+`addElementLines`, `elementDraftProblems`, `consentWithdrawn`, and the sealing primitives (`sealElement`, `openElement`,
+`wrapElementKey`, `rewrapElementKey` for a key sync rotation) with `ELEMENT_RULES` and `ELEMENT_LIMITS`.
 
 Storyboard helpers mirror kuno_protocol: `storyboardDurationS`, `storyboardFrames`, `storyboardTrimFrames`, `numFrames`,
 `shotPrompt`, `renderDurationS`, `validateStoryboard` and `storyboardStage` (see "Storyboards").

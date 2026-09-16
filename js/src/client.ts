@@ -1,6 +1,21 @@
 import { verifyEvidence, verifySignature, verifySignedManifest } from "./attestation.js";
 import { decryptBlob, encryptBlob, openSenderSession, padPayload, sha256Hex } from "./crypto.js";
+import {
+  addElementLines,
+  checkElementUse,
+  newElementId,
+  openElement,
+  openElementFile,
+  sealElement,
+  type Element,
+  type ElementDraft,
+  type ElementFileDraft,
+  type ElementRow,
+  type ElementUse,
+  type ElementsKey,
+} from "./elements.js";
 import { b64d, b64e, canonicalJson, concatBytes, utf8 } from "./encoding.js";
+import { ERROR_CODES, KunoError } from "./errors.js";
 import type {
   EnclaveInfo,
   Eligibility,
@@ -31,74 +46,8 @@ import type {
   StandardVideoSummary,
 } from "./types.js";
 
-/**
- * A failed request. `code` is the gateway's machine-readable reason. `details` holds the rest of
- * the error body, for example `reasons` on `private_mode_not_eligible` or `restricted_until` on
- * `account_restricted`.
- */
-export class KunoError extends Error {
-  constructor(
-    public readonly status: number,
-    public readonly code: string,
-    message: string,
-    public readonly details: Record<string, unknown> = {},
-  ) {
-    super(message);
-    this.name = "KunoError";
-  }
-
-  /** Why private mode isn't available (`private_mode_not_eligible`). */
-  get reasons(): string[] {
-    const r = this.details.reasons;
-    return Array.isArray(r) ? r.filter((x): x is string => typeof x === "string") : [];
-  }
-
-  /** Unix seconds until which the account is restricted (`account_restricted`), or null. */
-  get restrictedUntil(): number | null {
-    return typeof this.details.restricted_until === "number" ? this.details.restricted_until : null;
-  }
-
-  /** The request broke the content policy: `content_policy` (Standard) or `safety_blocked` (Private, in the enclave). */
-  get isContentPolicy(): boolean {
-    return this.code === "content_policy" || this.code === "safety_blocked";
-  }
-
-  /** What this code means, when it's one the gateway documents; otherwise null. */
-  get explanation(): string | null {
-    return ERROR_CODES[this.code as KunoErrorCode] ?? null;
-  }
-}
-
-/**
- * Error codes callers commonly branch on, and what each means. The gateway may send others;
- * `KunoError.code` is always the raw string.
- */
-export const ERROR_CODES = {
-  unauthorized: "The API key (or web session) was missing, unknown or revoked.",
-  gone: "This endpoint or credential was retired. Studio tokens (kwt_…) no longer work: use an API key, or a same-origin proxy that holds a web session.",
-  content_policy: "The request breaks the content policy, so the job wasn't created. All NSFW content is banned in both modes. Nothing was charged.",
-  safety_blocked: "The content check inside the enclave blocked the request before rendering. It counts as a strike.",
-  content_not_reviewable: "Operators only: this item's content can't be opened, because it isn't a report of child sexual abuse material or sexual content involving a minor, and no matching legal hold covers it.",
-  key_not_accepted: "An output_key can be attached to a report only when the reason is csam or sexual_minor.",
-  private_mode_not_eligible: "This account can't make private jobs yet; see `reasons`.",
-  account_restricted: "The account is restricted; see `restricted_until`.",
-  upload_blocked: "A Standard upload was refused by the scan.",
-  insufficient_balance: "The balance doesn't cover the job's price.",
-  invalid_params: "The request doesn't fit the model's limits (duration, size, frame rate, inputs, or a storyboard's shots).",
-  not_found: "No such job, blob or video on this account, or no such share link.",
-  deleted: "The owner deleted this video.",
-  removed: "The video was removed after a review under the content policy.",
-  not_ready: "The job hasn't finished yet.",
-  integrity: "What came back didn't match the enclave-signed receipt.",
-  decrypt_failed: "The video didn't open with this handle's output key, or with a share link's key.",
-  share_unavailable: "The share link no longer works (revoked, expired, video deleted or removed, or account closed; the public answer never says which), or, when making one, the video can't be shared right now.",
-  missing_key: "A private share link needs the video's key: the #k=… part of the link, or pass it separately.",
-  too_many_shares: "Too many working share links: 20 per video and 1000 per account. Revoke some first.",
-  invalid_expiry: "A share link's expiry must be between a minute and ten years from now, in Unix seconds, or null.",
-  rate_limited: "Too many requests from this network to public share links. Try again in a minute.",
-} as const;
-
-export type KunoErrorCode = keyof typeof ERROR_CODES;
+export { ERROR_CODES, KunoError } from "./errors.js";
+export type { KunoErrorCode } from "./errors.js";
 
 export interface GenerateInput {
   role: InputRole;
@@ -657,6 +606,50 @@ function receiptSignedBy(receipt: Receipt, signingPublicKey: string | null): boo
   }
 }
 
+export interface ElementWriteOptions {
+  /** The uploader affirms `ELEMENT_RULES` on every write; the gateway refuses one without it. */
+  affirmRules: true;
+}
+
+/** `kuno.elements.list`: the Elements this key opens, and any it can't. */
+export interface ElementList {
+  elements: Element[];
+  /** Stored Elements that didn't open: `key_rotated` (made under another key sync generation), `decrypt_failed` or `integrity`. */
+  unreadable: Array<{ elementId: string; revision: number; reason: string }>;
+  /** The vault's current `master_key_id`, or null while key sync is off. A key with another `keyId` is stale. */
+  keyId: string | null;
+  storedBytes: number;
+}
+
+/**
+ * `kuno.elements`: reusable characters, products, locations, styles and voices, sealed in this process with an Elements
+ * key (elements.ts) so KunoWorld stores only ciphertext. The website derives the key from key sync; a program reads it
+ * from the studio's Elements page (`parseElementsKey`).
+ */
+export interface ElementsApi {
+  /** Every stored Element as the gateway holds it (ciphertext), and the vault's current `master_key_id`. */
+  rows(): Promise<{ rows: ElementRow[]; keyId: string | null }>;
+  list(key: ElementsKey): Promise<ElementList>;
+  get(key: ElementsKey, elementId: string): Promise<Element>;
+  /** Seals the draft here, uploads the sealed files and stores the Element. */
+  create(key: ElementsKey, draft: ElementDraft, opts: ElementWriteOptions & { elementId?: string }): Promise<Element>;
+  /**
+   * Replaces an Element with a draft. Without `files` its files stay (and so does its key); with them, every file is
+   * replaced under a new key. Refused with `element_changed` when another device changed it since `element` was read.
+   */
+  update(key: ElementsKey, element: Element, draft: Omit<ElementDraft, "files"> & { files?: ElementFileDraft[] }, opts: ElementWriteOptions): Promise<Element>;
+  /** Deletes the Element, its record and its files. Deleting one that isn't there is harmless. */
+  delete(elementId: string): Promise<void>;
+  /** One file, downloaded, opened and checked against the Element's record. */
+  file(element: Element, position?: number): Promise<Uint8Array>;
+  /**
+   * A request with Elements in it: each Element's description added to the prompt (a storyboard's scene) on its own line,
+   * and its files added as inputs in the roles given. The files are opened here and then treated like any other input:
+   * sealed to the enclave for a Private job, uploaded as they are for a Standard one.
+   */
+  attach(request: GenerateRequest, uses: ElementUse[]): Promise<GenerateRequest>;
+}
+
 export class KunoClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
@@ -667,6 +660,20 @@ export class KunoClient {
    * Share links. `create`, `list` and `revoke` use this client's credential; `get` and `open` are
    * public and send none, so a client without an API key can open any link.
    */
+  /** Elements. Every call uses this client's credential: an API key, or the website's session through its proxy. */
+  readonly elements: ElementsApi = {
+    rows: () => this.elementRows(),
+    list: (key) => this.listElements(key),
+    get: async (key, elementId) => openElement(key, await this.json<ElementRow>("GET", `/v1/elements/${encodeURIComponent(elementId)}`)),
+    create: (key, draft, opts) => this.writeElement(key, opts.elementId ?? newElementId(), null, draft, opts),
+    update: (key, element, draft, opts) => this.writeElement(key, element.elementId, element, draft, opts),
+    delete: async (elementId) => {
+      await this.request("DELETE", `/v1/elements/${encodeURIComponent(elementId)}`);
+    },
+    file: (element, position) => this.elementFile(element, position),
+    attach: (request, uses) => this.attachElements(request, uses),
+  };
+
   readonly shares: ShareLinks = {
     create: (target, opts) => this.createShare(target, opts),
     list: (opts) => this.listShares(opts),
@@ -1085,6 +1092,91 @@ export class KunoClient {
   /** Public: the same lookup when you already have the digest (e.g. a /verify?sha256=… link). */
   async provenanceByDigest(contentDigest: string): Promise<Provenance> {
     return this.json<Provenance>("GET", `/v1/provenance/${encodeURIComponent(contentDigest.toLowerCase())}`, undefined, false);
+  }
+
+  // ------------------------------------------------------------ Elements (see `elements`)
+
+  private async elementRows(): Promise<{ rows: ElementRow[]; keyId: string | null }> {
+    const rows: ElementRow[] = [];
+    let cursor: string | null = null;
+    let keyId: string | null = null;
+    do {
+      const q = new URLSearchParams({ limit: "200" });
+      if (cursor) q.set("cursor", cursor);
+      const page: { elements: ElementRow[]; next_cursor: string | null; master_key_id: string | null } = await this.json("GET", `/v1/elements?${q}`);
+      rows.push(...page.elements);
+      keyId = page.master_key_id;
+      cursor = page.next_cursor;
+    } while (cursor);
+    return { rows, keyId };
+  }
+
+  private async listElements(key: ElementsKey): Promise<ElementList> {
+    const { rows, keyId } = await this.elementRows();
+    const list: ElementList = { elements: [], unreadable: [], keyId, storedBytes: rows.reduce((n, r) => n + r.files_bytes, 0) };
+    for (const row of rows) {
+      if (row.master_key_id !== key.keyId) {
+        list.unreadable.push({ elementId: row.element_id, revision: row.revision, reason: "key_rotated" });
+        continue;
+      }
+      try {
+        list.elements.push(openElement(key, row));
+      } catch (err) {
+        list.unreadable.push({ elementId: row.element_id, revision: row.revision, reason: err instanceof KunoError ? err.code : "decrypt_failed" });
+      }
+    }
+    return list;
+  }
+
+  private async writeElement(
+    key: ElementsKey,
+    elementId: string,
+    current: Element | null,
+    draft: Omit<ElementDraft, "files"> & { files?: ElementFileDraft[] },
+    opts: ElementWriteOptions,
+  ): Promise<Element> {
+    if (opts?.affirmRules !== true) throw new KunoError(0, "rules_not_affirmed", "Affirm the Elements rules (ELEMENT_RULES) to store an Element.");
+    const keep = current !== null && draft.files === undefined;
+    const sealed = keep
+      ? sealElement(key, elementId, { ...draft, files: [] }, { elementKey: current.elementKey, keepFiles: current.files })
+      : sealElement(key, elementId, { ...draft, files: draft.files ?? [] });
+    const fileBlobIds: string[] = [];
+    for (const file of sealed.files) {
+      const uploaded = await this.request("POST", "/v1/blobs", new Blob([new Uint8Array(file)]), "application/octet-stream");
+      fileBlobIds.push(((await uploaded.json()) as { blob_id: string }).blob_id);
+    }
+    const row = await this.json<ElementRow>("PUT", `/v1/elements/${encodeURIComponent(elementId)}`, {
+      master_key_id: key.keyId,
+      expected_revision: current?.revision ?? null,
+      meta: sealed.meta,
+      affirm_rules: true,
+      ...(keep ? {} : { wrapped_key: sealed.wrappedKey, file_blob_ids: fileBlobIds }),
+    });
+    return openElement(key, row);
+  }
+
+  private async elementFile(element: Element, position = 0): Promise<Uint8Array> {
+    const info = element.files[position];
+    if (!info) throw new KunoError(0, "invalid_element", `${element.name} has no file ${position}.`);
+    const response = await this.request("GET", `/v1/elements/${encodeURIComponent(element.elementId)}/files/${position}`);
+    return openElementFile(element.elementKey, element.elementId, position, new Uint8Array(await response.arrayBuffer()), info);
+  }
+
+  private async attachElements(request: GenerateRequest, uses: ElementUse[]): Promise<GenerateRequest> {
+    const storyboard = request.mode === "storyboard" || Boolean(request.shots?.length);
+    const inputs = [...(request.inputs ?? [])];
+    // Every use is checked before any file is downloaded, so a refused one costs nothing.
+    const planned = uses.map((use) => ({ use, positions: checkElementUse(use, storyboard) }));
+    for (const { use, positions } of planned) {
+      for (const position of positions) {
+        inputs.push({ role: use.role!, file: await this.elementFile(use.element, position), timeS: use.timeS });
+      }
+    }
+    return {
+      ...request,
+      prompt: addElementLines(request.prompt ?? "", uses.map((use) => use.element)),
+      ...(inputs.length ? { inputs } : {}),
+    };
   }
 
   // ------------------------------------------------------------ share links (see `shares`)

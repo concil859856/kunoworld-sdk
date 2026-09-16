@@ -36,6 +36,9 @@ export {
   verifyReceipt,
 } from "./client.js";
 export type {
+  ElementList,
+  ElementsApi,
+  ElementWriteOptions,
   KunoErrorCode,
   AnyJobHandle,
   CreateShareOptions,
@@ -87,3 +90,43 @@ export {
 } from "./crypto.js";
 export type { BlobVersion } from "./crypto.js";
 export { b64d, b64e, canonicalJson, fromHex, toHex } from "./encoding.js";
+export {
+  ELEMENT_AUDIO_TYPES,
+  ELEMENT_IMAGE_ROLES,
+  ELEMENT_IMAGE_TYPES,
+  ELEMENT_KINDS,
+  ELEMENT_LIMITS,
+  ELEMENT_RULES,
+  ELEMENT_VOICE_ROLES,
+  addElementLines,
+  consentWithdrawn,
+  deriveElementsKey,
+  elementDraftProblems,
+  elementPromptLine,
+  elementRoles,
+  formatElementsKey,
+  newElementId,
+  openElement,
+  openElementFile,
+  openElementRecord,
+  parseElementsKey,
+  rewrapElementKey,
+  sealElement,
+  sealElementFile,
+  sealElementRecord,
+  unwrapElementKey,
+  wrapElementKey,
+} from "./elements.js";
+export type {
+  Element,
+  ElementConsent,
+  ElementDraft,
+  ElementFileCheck,
+  ElementFileDraft,
+  ElementFileInfo,
+  ElementKind,
+  ElementRecord,
+  ElementRow,
+  ElementUse,
+  ElementsKey,
+} from "./elements.js";
