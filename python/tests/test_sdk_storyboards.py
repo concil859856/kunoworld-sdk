@@ -209,12 +209,12 @@ def test_the_price_estimate_is_the_stitched_seconds_at_the_models_rate():
     shots = [Shot("It leaves the harbor.", 5), Shot("Gulls follow it.", 5), Shot("Night falls.", 5, "cut")]
     stitched = storyboard_duration_s(FAST, specs((5, "fresh"), (5, "continue"), (5, "cut")), 24)
     assert stitched == pytest.approx(13.708, abs=1e-3)
-    assert client.estimate_price(FAST.id, shots=shots, resolution="720p") == round(0.05 * stitched, 4) == 0.6854
-    assert client.estimate_price(FAST.id, shots=shots, resolution="720p", privacy="standard") == round(0.04 * stitched, 4)
+    assert client.estimate_price(FAST.id, shots=shots, resolution="720p") == round(0.12 * stitched, 4) == 1.645
+    assert client.estimate_price(FAST.id, shots=shots, resolution="720p", privacy="standard") == round(0.09 * stitched, 4)
     # At 48 fps the shots' frames and the overlap trim differ, and the fps multiplier applies to the whole video.
     at_48 = storyboard_duration_s(FAST, specs((5, "fresh"), (5, "continue"), (5, "cut")), 48)
-    assert client.estimate_price(FAST.id, shots=shots, resolution="1080p", fps=48) == round(0.08 * at_48 * 1.5, 4)
-    assert client.estimate_price(FAST.id, duration_s=10, resolution="1080p") == 0.8
+    assert client.estimate_price(FAST.id, shots=shots, resolution="1080p", fps=48) == round(0.17 * at_48 * 1.5, 4)
+    assert client.estimate_price(FAST.id, duration_s=10, resolution="1080p") == 1.7
     with pytest.raises(KunoError) as refused:
         client.estimate_price("ltx-2.5-pro", shots=shots)
     assert refused.value.code == "invalid_params"

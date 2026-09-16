@@ -272,7 +272,7 @@ result.save("harbor.mp4")
   worker that fits it, however long the stitched video is.
 - **Price.** You pay the model's per-second rate for the stitched seconds. `kuno.estimate_price("ltx-2.5-fast",
   shots=[...], resolution="720p", privacy="private")` computes it from the published prices; the charge when the job
-  is accepted is what counts. Three 5 s shots with two joins are 13.708 s: $0.6854 Private at 720p.
+  is accepted is what counts. Three 5 s shots with two joins are 13.708 s: $1.645 Private at 720p.
 - **Seeds.** Shot *i* (from 0) renders with seed `(seed + i) mod 2^31`.
 - **Not verified yet.** Storyboards carry no step commitment, so validators don't step-audit them.
 
