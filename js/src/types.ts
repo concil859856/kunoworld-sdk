@@ -12,7 +12,8 @@ export type Mode =
   | "video_edit"
   | "extend_video"
   | "audio_to_video"
-  | "retake";
+  | "retake"
+  | "storyboard";
 
 export type InputRole =
   | "first_frame"
@@ -35,6 +36,31 @@ export type PrivacyMode = "private" | "standard";
 
 /** Attestation evidence kinds. `open` is a no-TEE miner, which only ever serves standard jobs. */
 export type TeeKind = "mock" | "tdx" | "open";
+
+/**
+ * How a storyboard shot attaches to the one before it (PROTOCOL.md, "Storyboards"). `continue` carries the previous
+ * shot's last latent frames and its sound into this one: one unbroken take. `cut` carries only the sound: a new picture
+ * over the same voice and room tone. `fresh` carries nothing. The first shot is always `fresh`.
+ */
+export type ShotJoin = "fresh" | "continue" | "cut";
+
+/** One storyboard shot as the gateway sees it: its length and its join. Its prompt is sealed. */
+export interface ShotSpec {
+  duration_s: number;
+  join: ShotJoin;
+}
+
+/** What a profile's storyboard mode accepts. Each shot also keeps to the profile's own duration limits. */
+export interface StoryboardLimits {
+  max_shots: number;
+  /** The stitched video's longest length. */
+  max_total_s: number;
+  /**
+   * A `continue` or `cut` shot's first latent frames repeat the previous shot's last ones and are trimmed from the video
+   * (LTX-2.5: 1 + 8 × (overlap − 1) frames, and the matching audio). 3 when absent.
+   */
+  overlap_latent_frames?: number;
+}
 
 export interface InputGroup {
   roles: InputRole[];
@@ -59,6 +85,8 @@ export interface Limits {
   seed: boolean;
   /** fps -> a lower duration cap at that frame rate (LTX-2.5 Fast goes past 10 s only at 24 or 25 fps). */
   max_duration_s_by_fps?: Record<string, number>;
+  /** Set where the profile offers storyboard mode. */
+  storyboard?: StoryboardLimits | null;
 }
 
 /** A profile's prices. Every price is a placeholder while `pricing_placeholder` is true. */
@@ -153,12 +181,18 @@ export interface ModelsResponse {
 export interface GenerationParams {
   profile_id: string;
   mode: Mode;
+  /** For a storyboard: the stitched video's length, `storyboardDurationS` of its shots, exactly. */
   duration_s: number;
   resolution: string;
   aspect_ratio: string;
   fps: number;
   audio: boolean;
   input_roles: InputRole[];
+  /**
+   * Storyboard mode only, every shot in order. Left out of every other job, so their encryption's associated data stays
+   * byte-identical to clients from before storyboards.
+   */
+  shots?: ShotSpec[];
 }
 
 export interface InputRef {
@@ -210,6 +244,7 @@ export interface Receipt {
 export interface JobStatus {
   job_id: string;
   status: JobState;
+  /** What the worker is doing; `shot 3/8` while a storyboard renders its shots (`storyboardStage` reads it). */
   stage: string | null;
   progress: number;
   params: GenerationParams;

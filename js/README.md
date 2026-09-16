@@ -233,6 +233,60 @@ Roles are `first_frame`, `last_frame`, `keyframe` (with `timeS`), `reference_ima
 `source_audio`. Which modes and roles a model accepts, and its limits, come from
 `await kuno.models()` — read `modes` and `limits` for the profile instead of assuming.
 
+## Storyboards: long videos from chained shots
+
+A storyboard is one job of 2 or more shots. One worker renders them one after another, inside one enclave, and delivers
+one stitched video with one receipt. Give `shots`; `prompt` is the scene every shot shares (characters, place, style)
+and may be empty. Each shot has its own prompt and length, and a `join` that says how it starts:
+
+| `join` | What the shot starts from |
+|---|---|
+| `continue` | the end of the shot before, picture and sound: one unbroken take |
+| `cut` | the sound of the shot before only: a new picture over the same voice and room tone |
+| `fresh` | nothing: a new shot, nothing carried over |
+
+The first shot is always `fresh`; leave `join` out and later shots `continue`.
+
+```js
+const job = await kuno.submit({
+  model: "ltx-2.5-fast",
+  prompt: "A small blue fishing boat and its old skipper, early morning, soft light.",
+  resolution: "720p",
+  shots: [
+    { prompt: "The boat leaves the harbor.", durationS: 5 },
+    { prompt: "Gulls follow it out to sea.", durationS: 5, join: "continue" },
+    { prompt: "Close on the skipper's hands hauling in the net.", durationS: 6, join: "cut" },
+  ],
+});
+
+const { video } = await kuno.wait(job, {
+  onProgress: (status) => {
+    const at = storyboardStage(status.stage);          // `shot 2/3` while it renders, then the usual stages
+    if (at) console.log(`Shot ${at.shot} of ${at.shots}`);
+  },
+});
+```
+
+- **Which models.** Profiles whose `limits.storyboard` is set: today `ltx-2.5-fast`, 2 to 12 shots
+  (`max_shots`) and at most 120 s stitched (`max_total_s`). Each shot keeps to the profile's own duration limits. A
+  storyboard takes no `inputs`.
+- **Length.** A `continue` or `cut` shot repeats the last frames of the shot before, and they are trimmed from the video:
+  17 frames each (about 0.7 s at 24 fps), so three 5 s shots joined make 13.71 s, not 15. The SDK sets
+  `params.duration_s` to the stitched length exactly; `storyboardDurationS(profile, shots, fps)` and
+  `storyboardFrames` compute it (`shots` as `{ duration_s, join }`).
+- **Prompts.** The model sees `shotPrompt(scene, shot.prompt)`: the scene, a blank line, then the shot's prompt. Each of
+  those must fit the profile's `max_prompt_chars`, and no shot prompt may be empty. In Private mode the scene and every
+  shot prompt are sealed; in Standard mode the body carries `shots: [{ prompt }]` beside `params.shots`. Shot *i* (from
+  0) renders with seed `(seed + i) mod 2^31`.
+- **Price.** You pay the per-second rate for the stitched length, with the fps multiplier. The long-clip multiplier and
+  the workers' serving envelopes look at the longest shot, since shots render one at a time (`renderDurationS(params)`);
+  `priceQuote`, `envelopeFits` and routing do the same.
+- **Checked before sending.** `submit` refuses a storyboard that breaks these rules with `invalid_params`, before
+  anything is sealed or sent; `validateStoryboard(profile, params)` runs the same checks with kuno_protocol's messages.
+- **Not verified yet.** Storyboards carry no step commitment, so validators don't step-audit them yet.
+
+`params.shots` exists only on storyboards, so every other job's encrypted request is byte-for-byte what it was.
+
 ## Routing and fallbacks
 
 Before submitting, the client asks the gateway which model will serve the request. The owner's
@@ -294,6 +348,9 @@ Verification options:
 
 `shareUrlWithKey(url, outputKey)` adds a private video's key to a link, and `parseShareLink(link)`
 returns `{ token, key }`.
+
+Storyboard helpers mirror kuno_protocol: `storyboardDurationS`, `storyboardFrames`, `storyboardTrimFrames`, `numFrames`,
+`shotPrompt`, `renderDurationS`, `validateStoryboard` and `storyboardStage` (see "Storyboards").
 
 Failures throw `KunoError` with the HTTP `status`, a machine-readable `code`, and the rest of the
 error body in `details` (with `reasons` and `restrictedUntil` getters). The package also exports

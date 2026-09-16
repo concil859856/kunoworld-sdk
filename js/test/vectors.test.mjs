@@ -14,6 +14,8 @@ import {
   gpuNonceFor,
   jobAad,
   reportDataFor,
+  storyboardDurationS,
+  storyboardFrames,
   toHex,
 } from "../dist/index.js";
 
@@ -51,6 +53,28 @@ test("attestation binding", () => {
 test("job AAD", () => {
   const { job_id, enclave_id, params, input_blob_ids, encoded } = VECTORS.job_aad;
   assert.equal(text(jobAad(job_id, enclave_id, params, input_blob_ids)), encoded);
+});
+
+// The vectors name profiles by id; only the fields the lengths depend on are needed, as in kuno_protocol/profiles.json.
+const STORYBOARD_PROFILES = {
+  "ltx-2.5-fast": { id: "ltx-2.5-fast", name: "LTX-2.5 Fast", family: "ltx-2.5", limits: { storyboard: { max_shots: 12, max_total_s: 120, overlap_latent_frames: 3 } } },
+};
+
+test("storyboard lengths", () => {
+  for (const { profile_id, fps, shots, frames, duration_s } of VECTORS.storyboard.lengths) {
+    const profile = STORYBOARD_PROFILES[profile_id];
+    assert.ok(profile, `a fixture for ${profile_id}`);
+    assert.equal(storyboardFrames(profile, shots, fps), frames);
+    // Exactly, not approximately: duration_s is part of the encryption's associated data.
+    assert.equal(storyboardDurationS(profile, shots, fps), duration_s);
+  }
+});
+
+test("storyboard job AAD", () => {
+  const { job_id, enclave_id, params, input_blob_ids, encoded } = VECTORS.storyboard.job_aad;
+  assert.equal(text(jobAad(job_id, enclave_id, params, input_blob_ids)), encoded);
+  const profile = STORYBOARD_PROFILES[params.profile_id];
+  assert.equal(storyboardDurationS(profile, params.shots, params.fps), params.duration_s);
 });
 
 test("receipt message", () => {

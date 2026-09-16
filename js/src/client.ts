@@ -20,6 +20,8 @@ import type {
   RouteFit,
   RouteResponse,
   ServingEnvelope,
+  ShotJoin,
+  ShotSpec,
   SharedVideo,
   SharedVideoDetails,
   ShareLink,
@@ -82,6 +84,7 @@ export const ERROR_CODES = {
   account_restricted: "The account is restricted; see `restricted_until`.",
   upload_blocked: "A Standard upload was refused by the scan.",
   insufficient_balance: "The balance doesn't cover the job's price.",
+  invalid_params: "The request doesn't fit the model's limits (duration, size, frame rate, inputs, or a storyboard's shots).",
   not_found: "No such job, blob or video on this account, or no such share link.",
   deleted: "The owner deleted this video.",
   removed: "The video was removed after a review under the content policy.",
@@ -108,7 +111,21 @@ export interface GenerateInput {
   endS?: number;
 }
 
+/** One shot of a storyboard request. */
+export interface GenerateShot {
+  /** What happens in this shot. The model sees the request's `prompt` (the shared scene), a blank line, then this. */
+  prompt: string;
+  /** This shot's rendered length, within the profile's own duration limits. */
+  durationS: number;
+  /**
+   * How it attaches to the shot before: `continue` (one unbroken take), `cut` (a new picture over the same sound) or
+   * `fresh` (nothing carried over). Default: `fresh` for the first shot, which must be, and `continue` after it.
+   */
+  join?: ShotJoin;
+}
+
 export interface GenerateRequest {
+  /** What to make. For a storyboard: the scene every shot shares (characters, place, style); it may be empty. */
   prompt: string;
   model?: string;
   family?: string;
@@ -122,6 +139,11 @@ export interface GenerateRequest {
   negativePrompt?: string;
   inputs?: GenerateInput[];
   options?: Record<string, unknown>;
+  /**
+   * A storyboard: 2 or more shots rendered one after another by one worker and delivered as one stitched video. Sets
+   * `mode` to `storyboard` and takes no `inputs`; `durationS` is ignored, the length comes from the shots.
+   */
+  shots?: GenerateShot[];
   /**
    * `private` (default): encrypted here to an attested confidential enclave; nobody at KunoWorld
    * can read it. `standard`: sent to KunoWorld readable, so KunoWorld and the GPU provider can see
@@ -247,15 +269,18 @@ export function privacyModes(profile: ModelProfile): PrivacyMode[] {
   return profile.pricing.standard_usd_per_second ? ["private", "standard"] : ["private"];
 }
 
+/** The params a price depends on. `shots` only for a storyboard, whose longest shot decides the long-clip rule. */
+export type PricedParams = Pick<GenerationParams, "resolution" | "duration_s" | "fps"> & Partial<Pick<GenerationParams, "shots">>;
+
 /**
  * The gateway's price for a job (kuno_protocol `ModelProfile.price_usd`): the per-second rate for the privacy
  * mode x duration x the fps multiplier (and, in Private mode, the long-clip multiplier), never below the profile's
- * minimum charge. Null where the profile has no such price: a resolution it doesn't render, or Standard on a
- * Private-only profile.
+ * minimum charge. A storyboard pays for its stitched `duration_s`; the long-clip rule looks at its longest shot.
+ * Null where the profile has no such price: a resolution it doesn't render, or Standard on a Private-only profile.
  */
 export function priceQuote(
   profile: ModelProfile,
-  params: Pick<GenerationParams, "resolution" | "duration_s" | "fps">,
+  params: PricedParams,
   privacy: PrivacyMode = "private",
 ): PriceQuote | null {
   const pricing = profile.pricing;
@@ -263,7 +288,8 @@ export function priceQuote(
   const rate = (privacy === "private" ? pricing.usd_per_second : pricing.standard_usd_per_second)?.[params.resolution];
   if (rate === undefined) return null;
   let multiplier = pricing.fps_multipliers?.[String(params.fps)] ?? 1;
-  if (privacy === "private" && pricing.long_clip && params.duration_s > pricing.long_clip.over_s) {
+  // A long clip costs more per second to render; a storyboard's shots are rendered one at a time, so its longest counts.
+  if (privacy === "private" && pricing.long_clip && renderDurationS(params) > pricing.long_clip.over_s) {
     multiplier *= pricing.long_clip.multiplier;
   }
   const raw = rate * params.duration_s * multiplier;
@@ -273,37 +299,191 @@ export function priceQuote(
 
 export function priceUsd(
   profile: ModelProfile,
-  params: Pick<GenerationParams, "resolution" | "duration_s" | "fps">,
+  params: PricedParams,
   privacy: PrivacyMode = "private",
 ): number | null {
   return priceQuote(profile, params, privacy)?.usd ?? null;
 }
 
 /**
- * Whether a job fits a worker's serving envelope (kuno_protocol.envelope): `duration_s` at most the longest the worker
- * serves at the job's resolution, aspect ratio and fps. No envelope, or none for the profile, means the profile's limits.
+ * Whether a job fits a worker's serving envelope (kuno_protocol.envelope): its render duration (`duration_s`, or a
+ * storyboard's longest shot, since shots render one at a time) at most the longest the worker serves at the job's
+ * resolution, aspect ratio and fps. No envelope, or none for the profile, means the profile's limits.
  */
 export function envelopeFits(
   envelope: ServingEnvelope | null | undefined,
-  params: Pick<GenerationParams, "profile_id" | "resolution" | "aspect_ratio" | "fps" | "duration_s">,
+  params: Pick<GenerationParams, "profile_id" | "resolution" | "aspect_ratio" | "fps" | "duration_s"> & Partial<Pick<GenerationParams, "shots">>,
 ): boolean {
   const table = envelope?.[params.profile_id];
   if (!table) return true;
   const longest = table[params.resolution]?.[params.aspect_ratio]?.[String(params.fps)];
-  return typeof longest === "number" && params.duration_s <= longest + 1e-6;
+  return typeof longest === "number" && renderDurationS(params) <= longest + 1e-6;
 }
 
-/** The fields `/v1/route` filters workers by, as the caller gave them: the defaults depend on the profile the route picks. */
-function routeFit(req: Pick<GenerateRequest, "resolution" | "aspectRatio" | "fps" | "durationS">): RouteFit {
-  return { resolution: req.resolution, aspectRatio: req.aspectRatio, fps: req.fps, durationS: req.durationS };
+/**
+ * The fields `/v1/route` filters workers by, as the caller gave them: the defaults depend on the profile the route picks.
+ * A storyboard is filtered by its longest shot, the longest single render a worker has to fit.
+ */
+function routeFit(req: Pick<GenerateRequest, "resolution" | "aspectRatio" | "fps" | "durationS" | "shots">): RouteFit {
+  const durationS = req.shots?.length ? Math.max(...req.shots.map((shot) => shot.durationS)) : req.durationS;
+  return { resolution: req.resolution, aspectRatio: req.aspectRatio, fps: req.fps, durationS };
 }
 
-/** Same rules as the Python SDK: defaults from the profile; adapt after a fallback. */
+// ------------------------------------------------------------ storyboards (kuno_protocol.profiles)
+
+/** Python's round(): halves go to the even neighbour. */
+function roundHalfEven(x: number): number {
+  const r = Math.round(x);
+  return Math.abs(x % 1) === 0.5 && r % 2 !== 0 ? r - 1 : r;
+}
+
+/** Frame count a profile actually renders for a duration: MiniMax H3 renders 17n+5 frames at 24 fps (at most 345), LTX-2.5 8k+1. */
+export function numFrames(profile: Pick<ModelProfile, "family">, durationS: number, fps: number): number {
+  if (profile.family === "minimax-h3") return Math.min(345, 17 * Math.ceil((24 * durationS - 5) / 17) + 5);
+  return 8 * Math.max(1, roundHalfEven((durationS * fps) / 8)) + 1;
+}
+
+function storyboardLimits(profile: Pick<ModelProfile, "name" | "limits">) {
+  const board = profile.limits.storyboard;
+  if (!board) throw new KunoError(0, "invalid_params", `${profile.name} does not support storyboard`);
+  return board;
+}
+
+/**
+ * Frames a `continue` or `cut` shot repeats from the shot before, and loses from the stitched video: 1 + 8 × (overlap − 1),
+ * 17 for LTX-2.5 Fast. Throws `invalid_params` for a profile without storyboard mode.
+ */
+export function storyboardTrimFrames(profile: Pick<ModelProfile, "name" | "limits">): number {
+  return 1 + 8 * ((storyboardLimits(profile).overlap_latent_frames ?? 3) - 1);
+}
+
+/** The stitched video's frame count: every shot's rendered frames, less the repeated head of each joined shot. */
+export function storyboardFrames(profile: Pick<ModelProfile, "name" | "family" | "limits">, shots: ShotSpec[], fps: number): number {
+  const trim = storyboardTrimFrames(profile);
+  return shots.reduce((sum, shot) => sum + numFrames(profile, shot.duration_s, fps) - (shot.join !== "fresh" ? trim : 0), 0);
+}
+
+/**
+ * What `GenerationParams.duration_s` must be for a storyboard: its stitched frames / fps, exactly (35.375 for eight 5 s
+ * shots joined at 24 fps). It is shorter than the shots added up: each joined shot loses its overlap.
+ */
+export function storyboardDurationS(profile: Pick<ModelProfile, "name" | "family" | "limits">, shots: ShotSpec[], fps: number): number {
+  return storyboardFrames(profile, shots, fps) / fps;
+}
+
+/** The prompt the model sees for one storyboard shot: the shared scene, a blank line, then the shot's own prompt. */
+export function shotPrompt(scene: string, prompt: string): string {
+  const s = scene.trim();
+  return s ? `${s}\n\n${prompt.trim()}` : prompt.trim();
+}
+
+/** The longest single model call a job needs: its duration, or a storyboard's longest shot. Envelopes and the long-clip price use it. */
+export function renderDurationS(params: Pick<GenerationParams, "duration_s"> & Partial<Pick<GenerationParams, "shots">>): number {
+  return params.shots?.length ? Math.max(...params.shots.map((shot) => shot.duration_s)) : params.duration_s;
+}
+
+/** The shot a storyboard is rendering, from a job's `stage` (`shot 3/8`), or null for any other stage. */
+export function storyboardStage(stage: string | null | undefined): { shot: number; shots: number } | null {
+  const match = /^shot (\d+)\/(\d+)$/.exec(stage?.trim() ?? "");
+  if (!match) return null;
+  const shot = Number(match[1]);
+  const shots = Number(match[2]);
+  return shot >= 1 && shot <= shots ? { shot, shots } : null;
+}
+
+const g = (n: number) => String(Number(n));
+
+function checkDuration(profile: ModelProfile, durationS: number, fps: number, what: string): void {
+  const lim = profile.limits;
+  const fail = (message: string) => {
+    throw new KunoError(0, "invalid_params", message);
+  };
+  if (!(lim.min_duration_s <= durationS && durationS <= lim.max_duration_s)) {
+    fail(`${what} must be between ${g(lim.min_duration_s)} and ${g(lim.max_duration_s)} seconds`);
+  }
+  const step = lim.duration_step_s || 1;
+  const steps = (durationS - lim.min_duration_s) / step;
+  if (Math.abs(steps - Math.round(steps)) > 1e-6) fail(`${what} must be in ${g(step)}-second steps`);
+  const fpsMax = lim.max_duration_s_by_fps?.[String(fps)];
+  if (fpsMax !== undefined && durationS > fpsMax) fail(`at ${fps} fps, ${what} must be at most ${g(fpsMax)} seconds`);
+}
+
+/**
+ * kuno_protocol's storyboard rules (`validate_params`), with its messages: 2 to `max_shots` shots, each within the
+ * profile's own duration limits, the first `fresh`, every joined shot long enough to keep frames after its overlap, a
+ * stitched length within `max_total_s`, and `duration_s` exactly that length. Throws `invalid_params`.
+ */
+export function validateStoryboard(
+  profile: ModelProfile,
+  params: Pick<GenerationParams, "mode" | "fps" | "duration_s"> & Partial<Pick<GenerationParams, "shots">>,
+): void {
+  const fail = (message: string): never => {
+    throw new KunoError(0, "invalid_params", message);
+  };
+  if (params.mode !== "storyboard") {
+    if (params.shots != null) fail("shots are only for storyboard mode");
+    return;
+  }
+  const board = storyboardLimits(profile);
+  const shots = params.shots ?? [];
+  if (!(shots.length >= 2 && shots.length <= board.max_shots)) fail(`a storyboard needs between 2 and ${board.max_shots} shots`);
+  if (shots[0].join !== "fresh") fail("a storyboard's first shot must be fresh: there is nothing before it to join");
+  const trim = storyboardTrimFrames(profile);
+  shots.forEach((shot, i) => {
+    checkDuration(profile, shot.duration_s, params.fps, `shot ${i + 1}'s duration`);
+    if (shot.join !== "fresh" && numFrames(profile, shot.duration_s, params.fps) <= trim) {
+      fail(`shot ${i + 1} is too short to join: it would keep no frames after its ${trim}-frame overlap`);
+    }
+  });
+  const expected = storyboardDurationS(profile, shots, params.fps);
+  if (expected > board.max_total_s + 1e-6) {
+    fail(`a storyboard's stitched video must be at most ${g(board.max_total_s)} seconds, these shots make ${expected.toFixed(3)}`);
+  }
+  if (Math.abs(params.duration_s - expected) > 1e-6) fail(`a storyboard's duration_s must be its stitched length, ${expected} seconds`);
+}
+
+/** The shots as the gateway sees them: each shot's length and join, the first `fresh` and the rest `continue` unless given. */
+function shotSpecs(shots: GenerateShot[]): ShotSpec[] {
+  return shots.map((shot, i) => ({ duration_s: shot.durationS, join: shot.join ?? (i === 0 ? "fresh" : "continue") }));
+}
+
+/** A request's mode, and the request-level storyboard checks that need no profile. Throws `invalid_params`. */
+function requestMode(req: GenerateRequest, roles: InputRole[]): Mode {
+  const fail = (message: string): never => {
+    throw new KunoError(0, "invalid_params", message);
+  };
+  if (req.shots != null && req.mode !== undefined && req.mode !== "storyboard") fail("shots are only for storyboard mode");
+  const mode = req.shots != null ? "storyboard" : req.mode ?? inferMode(roles);
+  if (mode !== "storyboard") return mode;
+  if (!req.shots || req.shots.length < 2) fail("a storyboard needs at least 2 shots");
+  if (roles.length) fail("a storyboard takes no inputs");
+  req.shots!.forEach((shot, i) => {
+    if (typeof shot.prompt !== "string" || !shot.prompt.trim()) fail(`shot ${i + 1} needs a prompt`);
+  });
+  return mode;
+}
+
+/** The profile-level checks before anything is sealed or sent: the shots' limits and each shot's prompt length with the scene. */
+function checkStoryboardRequest(profile: ModelProfile, params: GenerationParams, req: GenerateRequest): void {
+  validateStoryboard(profile, params);
+  if (params.mode !== "storyboard") return;
+  const max = profile.limits.max_prompt_chars;
+  req.shots!.forEach((shot, i) => {
+    if ([...shotPrompt(req.prompt ?? "", shot.prompt)].length > max) {
+      throw new KunoError(0, "invalid_params", `shot ${i + 1}'s prompt, with the scene, must be at most ${max} characters`);
+    }
+  });
+}
+
+/**
+ * Same rules as the Python SDK: defaults from the profile; adapt after a fallback. A storyboard (`storyboard` mode, with
+ * `req.shots`) gets its `shots` and its stitched `duration_s`; after a fallback each shot is fitted to the duration limits.
+ */
 export function fitParams(
   profile: ModelProfile,
   mode: Mode,
   roles: InputRole[],
-  req: Pick<GenerateRequest, "durationS" | "resolution" | "aspectRatio" | "fps" | "audio">,
+  req: Pick<GenerateRequest, "durationS" | "resolution" | "aspectRatio" | "fps" | "audio" | "shots">,
   fallbackReason: string | null,
 ): GenerationParams {
   const lim = profile.limits;
@@ -320,7 +500,7 @@ export function fitParams(
   let duration = req.durationS;
   if (duration === undefined) duration = Math.min(Math.max(5, lim.min_duration_s), maxDuration);
   else if (lenient) duration = Math.min(Math.max(duration, lim.min_duration_s), maxDuration);
-  return {
+  const params: GenerationParams = {
     profile_id: profile.id,
     mode,
     duration_s: duration,
@@ -330,10 +510,20 @@ export function fitParams(
     audio: (req.audio ?? true) && lim.audio,
     input_roles: roles,
   };
+  if (mode === "storyboard") {
+    const shots = shotSpecs(req.shots ?? []).map((shot) =>
+      lenient ? { ...shot, duration_s: Math.min(Math.max(shot.duration_s, lim.min_duration_s), maxDuration) } : shot,
+    );
+    params.shots = shots;
+    params.duration_s = storyboardDurationS(profile, shots, fps);
+  }
+  return params;
 }
 
+/** Associated data for the HPKE seal. Mirrors `job_aad` in kuno_protocol; `shots` is written only when set, like Python's. */
 export function jobAad(jobId: string, enclaveId: string, params: GenerationParams, inputBlobIds: string[]): Uint8Array {
-  return canonicalJson({ v: 1, job_id: jobId, enclave_id: enclaveId, params, inputs: inputBlobIds });
+  const { shots, ...rest } = params;
+  return canonicalJson({ v: 1, job_id: jobId, enclave_id: enclaveId, params: shots == null ? rest : params, inputs: inputBlobIds });
 }
 
 export function verifyReceipt(receipt: Receipt, signingPublicKey: Uint8Array): boolean {
@@ -595,13 +785,14 @@ export class KunoClient {
   private async submitStandard(req: GenerateRequest, onStage?: (stage: SubmitStage) => void): Promise<StandardJobHandle> {
     const inputs = req.inputs ?? [];
     const roles = inputs.map((i) => i.role);
-    const mode = req.mode ?? inferMode(roles);
+    const mode = requestMode(req, roles);
 
     onStage?.("routing");
     const route = await this.route(mode, req.model, req.family, "standard", routeFit(req));
     const profile = (await this.models(0)).models.find((m) => m.id === route.profile_id);
     if (!profile) throw new KunoError(404, "unknown_model", `Unknown model ${route.profile_id}.`);
     const params = fitParams(profile, mode, roles, req, route.fallback_reason);
+    checkStoryboardRequest(profile, params, req);
 
     const refs: Array<Record<string, unknown>> = [];
     for (const [index, input] of inputs.entries()) {
@@ -626,11 +817,13 @@ export class KunoClient {
     const status = await this.json<JobStatus>("POST", "/v1/standard/videos", {
       job_id: crypto.randomUUID(),
       params,
+      // For a storyboard, the scene; each shot's own prompt goes in `shots`, in order.
       prompt: req.prompt,
       negative_prompt: req.negativePrompt ?? null,
       seed: req.seed ?? null,
       options: req.options ?? {},
       inputs: refs,
+      ...(params.shots ? { shots: req.shots!.map((shot) => ({ prompt: shot.prompt })) } : {}),
     });
     return {
       privacy: "standard",
@@ -658,13 +851,14 @@ export class KunoClient {
   private async submitPrivate(req: GenerateRequest, onStage?: (stage: SubmitStage) => void): Promise<JobHandle> {
     const inputs = req.inputs ?? [];
     const roles = inputs.map((i) => i.role);
-    const mode = req.mode ?? inferMode(roles);
+    const mode = requestMode(req, roles);
 
     onStage?.("routing");
     const route = await this.route(mode, req.model, req.family, undefined, routeFit(req));
     const profile = (await this.models(0)).models.find((m) => m.id === route.profile_id);
     if (!profile) throw new KunoError(404, "unknown_model", `Unknown model ${route.profile_id}.`);
     const params = fitParams(profile, mode, roles, req, route.fallback_reason);
+    checkStoryboardRequest(profile, params, req);
 
     onStage?.("verifying");
     const enclave = await this.pickEnclave(route, params);
@@ -697,11 +891,13 @@ export class KunoClient {
     }
     const payload = {
       v: 1,
+      // For a storyboard, the scene; each shot's own prompt is sealed in `shots`, in order.
       prompt: req.prompt,
       negative_prompt: req.negativePrompt ?? null,
       seed: req.seed ?? null,
       inputs: refs,
       options: req.options ?? {},
+      ...(params.shots ? { shots: req.shots!.map((shot) => ({ prompt: shot.prompt })) } : {}),
     };
     // Padded to a power-of-two bucket, so the request's size doesn't give away the prompt's length.
     let plaintext: Uint8Array;
