@@ -108,6 +108,9 @@ operator credit, no active restriction and fewer than 2 blocked jobs in 30 days.
 | `scan_unavailable` (503) | the upload scanner couldn't be reached; nothing was charged, try again |
 | `unsupported_media` (422) | the gateway didn't recognize an upload's type (it reads the bytes, not the content-type) |
 | `content_policy` (422) | a standard job breaks the content policy (all NSFW is banned); not created, nothing charged |
+| `invalid_params` (422, or before sending) | the request doesn't fit the model's limits, including a storyboard's shots and stitched length |
+| `invalid_shots` (422, or before sending) | a storyboard without one non-empty prompt per shot, or `shots` on a job that isn't a storyboard |
+| `prompt_too_long` (422, or before sending) | a prompt, or a storyboard's scene and one shot's prompt together, is over the model's limit |
 | `safety_blocked` | the in-enclave content check stopped the job; it counts as a strike |
 | `bad_output` | the video didn't match its receipt, so the job failed and was refunded |
 | `deleted` / `removed` (410) | the video was deleted by its owner, or removed after review |
@@ -228,6 +231,51 @@ seconds), `reference_images`, `reference_videos`, `reference_audio`, `source_vid
 `seed` and `negative_prompt`. Which modes and inputs a model accepts, and its limits, come
 from `kuno.profile("ltx-2.5-fast")`; read them instead of assuming.
 
+## Storyboards (long videos from chained shots)
+
+A storyboard is one job of 2 or more shots that one worker renders one after another and returns as one stitched video,
+with one receipt. Pass `shots` to `generate` and the mode is `storyboard`; `prompt` is then the scene every shot shares
+(characters, place, style) and may be `""`. Only `ltx-2.5-fast` offers it today: at most 12 shots and 120 s stitched
+(`kuno.profile("ltx-2.5-fast").limits.storyboard`).
+
+```python
+from kunoworld import Shot
+
+result = kuno.generate(
+    "A small blue fishing boat with a red stripe, in a quiet harbor. Soft morning light, 35 mm film.",
+    shots=[
+        Shot("The boat leaves the harbor, gulls circling.", duration_s=5),
+        Shot("It passes the lighthouse at the end of the breakwater.", duration_s=5),                 # join="continue"
+        Shot("Close on the fisherman at the wheel, humming to himself.", duration_s=4, join="cut"),
+        Shot("Night: the boat's lamp alone on a dark sea.", duration_s=6, join="fresh"),
+    ],
+    model="ltx-2.5-fast",
+    resolution="720p",
+)
+result.save("harbor.mp4")
+```
+
+- **`Shot(prompt, duration_s=None, join=None)`.** Each shot keeps to the model's own clip limits (2 to 20 s in 1 s steps
+  at 24 or 25 fps, up to 10 s at 48 or 50); `duration_s=None` is 5 s. The model sees the scene, a blank line and the
+  shot's prompt, and that must fit `limits.max_prompt_chars` (`prompt_too_long`).
+- **`join`** says what a shot starts from. `"continue"`: the previous shot's last frames and sound, so the take goes on
+  unbroken. `"cut"`: only the sound, so a new picture over the same voice and room tone. `"fresh"`: nothing. The first
+  shot is always `"fresh"`; `join=None` is `"fresh"` for the first shot and `"continue"` after it.
+- **Length.** The client computes `duration_s` from the shots (`kuno_protocol.profiles.storyboard_duration_s`): a
+  `continue` or `cut` shot repeats the previous shot's last 17 frames, which are trimmed, so the video is a little
+  shorter than the shots added up. Don't pass `duration_s` with `shots` (`invalid_params`). Storyboards take no
+  inputs (`invalid_inputs`), and every shot needs a prompt (`invalid_shots`).
+- **Private and Standard.** In Private mode the shot prompts are sealed with the scene, as the prompt is. In Standard
+  mode they are sent as `shots` next to `prompt`; the gateway checks each one against the content policy and returns
+  them wherever it returns the prompt (`standard_videos()`).
+- **Routing.** Shots render one at a time, so the client asks `/v1/route` for the longest shot (`duration_s`) and picks a
+  worker that fits it, however long the stitched video is.
+- **Price.** You pay the model's per-second rate for the stitched seconds. `kuno.estimate_price("ltx-2.5-fast",
+  shots=[...], resolution="720p", privacy="private")` computes it from the published prices; the charge when the job
+  is accepted is what counts. Three 5 s shots with two joins are 13.708 s: $0.6854 Private at 720p.
+- **Seeds.** Shot *i* (from 0) renders with seed `(seed + i) mod 2^31`.
+- **Not verified yet.** Storyboards carry no step commitment, so validators don't step-audit them.
+
 ## Routing and fallbacks
 
 Before submitting, the client asks the gateway which model will serve the request. The owner's
@@ -265,7 +313,8 @@ NVIDIA rotates it; `country` is for development gateways only. Call `close()` wh
 | `models()` / `profile(profile_id)` | model profiles, availability and the switch |
 | `manifest()` | the golden manifest in use |
 | `route(mode, model=None, family=None, privacy="private", *, resolution=None, aspect_ratio=None, fps=None, duration_s=None)` | which profile and enclaves would serve a request; the size, frame rate and duration list only workers whose hardware can fit them (their serving envelope). `generate`, `prepare` and `submit_standard` send the request's own |
-| `generate(prompt, ..., privacy="private")` | private: route, verify, encrypt, submit; standard: upload, create. Waits by default |
+| `generate(prompt, ..., shots=None, privacy="private")` | private: route, verify, encrypt, submit; standard: upload, create. Waits by default. With `shots`, a storyboard |
+| `estimate_price(model, *, duration_s=None, shots=None, resolution=None, aspect_ratio=None, fps=None, privacy="private")` | what such a job would cost, from the published prices; a storyboard's stitched seconds |
 | `prepare(...)` / `submit(prepared)` | the private path, in two steps |
 | `submit_standard(prompt, ...)` / `upload_standard(role, data, mime)` | the standard path, in pieces |
 | `delete(job_id)` | delete a job's stored content, in either mode |

@@ -20,7 +20,15 @@ from kuno_protocol.canonical import b64d, b64e, sha256_hex
 from kuno_protocol.crypto import DecryptionError, SenderSession
 from kuno_protocol.envelope import fits as envelope_fits
 from kuno_protocol.media import sniff_mime
-from kuno_protocol.profiles import InputRole, Mode, ModelProfile
+from kuno_protocol.profiles import (
+    InputRole,
+    Mode,
+    ModelProfile,
+    ParamError,
+    PrivacyModeUnavailable,
+    shot_prompt,
+    storyboard_duration_s,
+)
 from kuno_protocol.receipts import Receipt, verify_receipt
 from kuno_protocol.schemas import (
     GenerationParams,
@@ -30,6 +38,9 @@ from kuno_protocol.schemas import (
     JobStatus,
     RouteResponse,
     SealedPayload,
+    ShotJoin,
+    ShotPrompt,
+    ShotSpec,
     input_label,
     job_aad,
     output_label,
@@ -51,6 +62,9 @@ ERROR_CODES: dict[str, str] = {
     "gone": "This endpoint or credential was retired. Studio tokens (kwt_...) no longer work: use an API key.",
     "content_policy": "The request breaks the content policy, so the job wasn't created. All NSFW content is banned in "
     "both modes. Nothing was charged.",
+    "invalid_params": "The request doesn't fit the model's limits (duration, size, frame rate, or a storyboard's shots).",
+    "invalid_shots": "A storyboard needs one non-empty prompt per shot, and only storyboards take shots.",
+    "prompt_too_long": "A prompt is over the model's limit; for a storyboard, the scene and one shot's prompt together.",
     "safety_blocked": "The content check inside the enclave blocked the request before rendering. It counts as a strike.",
     "content_not_reviewable": "Operators only: this item's content can't be opened, because it isn't a report of child "
     "sexual abuse material or sexual content involving a minor, and no matching legal hold covers it.",
@@ -124,6 +138,21 @@ class Input:
         if mime is None:
             raise KunoError(0, "unsupported_media", f"Could not recognize the {role.value} file type.")
         return cls(role=role, data=data, mime=mime, **extra)
+
+
+@dataclass
+class Shot:
+    """One shot of a storyboard (PROTOCOL.md, "Storyboards"): what happens in it, how long it runs, and how it follows the
+    shot before it. The shots render one after another on one worker and come back as one stitched video.
+
+    `join` is `"fresh"` (starts from nothing), `"continue"` (the same take goes on: it starts from the previous shot's
+    last frames and sound) or `"cut"` (a new picture over the same voice and room tone). None is `"fresh"` for the first
+    shot and `"continue"` after it. `duration_s` keeps to the model's own clip limits; None is the length `generate`
+    uses for a clip (5 s where the model allows)."""
+
+    prompt: str
+    duration_s: float | None = None
+    join: ShotJoin | None = None
 
 
 def infer_mode(roles: Iterable[InputRole]) -> Mode:
@@ -400,6 +429,7 @@ class KunoClient:
         source_video: Source | None = None,
         source_audio: Source | None = None,
         options: dict[str, Any] | None = None,
+        shots: Iterable[Shot] | None = None,
         privacy: Privacy = "private",
         wait: bool = True,
         timeout: float = 1800.0,
@@ -407,7 +437,11 @@ class KunoClient:
     ) -> GenerationResult | VideoJob | StandardVideoJob:
         """`privacy="private"` (default) encrypts on this machine to an attested confidential enclave.
         `privacy="standard"` sends the prompt and inputs to KunoWorld readable: KunoWorld and the
-        GPU provider can see them and the video; there is no client-side encryption."""
+        GPU provider can see them and the video; there is no client-side encryption.
+
+        With `shots`, the job is a storyboard (mode `storyboard`): one video stitched from the shots in order, and
+        `prompt` is the scene they share (characters, place, style), which may be empty. Its `duration_s` is computed
+        from the shots (`kuno_protocol.profiles.storyboard_duration_s`), so leave `duration_s` unset; it takes no inputs."""
         if privacy not in ("private", "standard"):
             raise KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".')
         inputs: list[Input] = []
@@ -428,6 +462,7 @@ class KunoClient:
             standard = self.submit_standard(
                 prompt,
                 inputs=inputs,
+                shots=shots,
                 model=model,
                 family=family,
                 mode=Mode(mode) if mode else None,
@@ -445,6 +480,7 @@ class KunoClient:
         prepared = self.prepare(
             prompt,
             inputs=inputs,
+            shots=shots,
             model=model,
             family=family,
             mode=Mode(mode) if mode else None,
@@ -476,14 +512,20 @@ class KunoClient:
         seed: int | None = None,
         negative_prompt: str | None = None,
         options: dict[str, Any] | None = None,
+        shots: Iterable[Shot] | None = None,
     ) -> PreparedJob:
-        """Routes, verifies the enclave, encrypts and uploads inputs, and seals the request."""
+        """Routes, verifies the enclave, encrypts and uploads inputs, and seals the request. With `shots`, a storyboard:
+        the shot prompts are sealed with the scene (`SealedPayload.shots`)."""
         inputs = inputs or []
-        mode = mode or infer_mode(i.role for i in inputs)
-        # Only workers whose hardware can fit what was asked for (their serving envelope).
-        route = self.route(mode, model, family, resolution=resolution, aspect_ratio=aspect_ratio, fps=fps, duration_s=duration_s)
+        shots = _check_storyboard(shots, inputs, mode, duration_s)
+        mode = Mode.STORYBOARD if shots is not None else (mode or infer_mode(i.role for i in inputs))
+        # Only workers whose hardware can fit what was asked for (their serving envelope); a storyboard's longest shot.
+        route = self.route(
+            mode, model, family, resolution=resolution, aspect_ratio=aspect_ratio, fps=fps, duration_s=_route_duration(duration_s, shots)
+        )
         profile = self.profile(route.profile_id)
-        params = _fit_params(profile, mode, inputs, duration_s, resolution, aspect_ratio, fps, audio, route.fallback_reason)
+        params = _fit_params(profile, mode, inputs, duration_s, resolution, aspect_ratio, fps, audio, route.fallback_reason, shots=shots)
+        _check_shot_prompts(profile, prompt, shots)
         enclave = self._pick_enclave(self._fitting_route(route, params))
 
         job_id = str(uuid.uuid4())
@@ -507,7 +549,10 @@ class KunoClient:
                     end_s=item.end_s,
                 )
             )
-        payload = SealedPayload(prompt=prompt, negative_prompt=negative_prompt, seed=seed, inputs=refs, options=options or {})
+        payload = SealedPayload(
+            prompt=prompt, negative_prompt=negative_prompt, seed=seed, inputs=refs, options=options or {},
+            shots=None if shots is None else [ShotPrompt(prompt=shot.prompt) for shot in shots],
+        )
         try:
             # Padded to a power-of-two bucket, so the request's size doesn't give away the prompt's length.
             ciphertext = seal_payload(session, payload, job_aad(job_id, enclave["enclave_id"], params, blob_ids))
@@ -546,15 +591,20 @@ class KunoClient:
         negative_prompt: str | None = None,
         options: dict[str, Any] | None = None,
         webhook_url: str | None = None,
+        shots: Iterable[Shot] | None = None,
     ) -> StandardVideoJob:
-        """Standard mode: uploads the inputs as they are and lets the gateway seal the job to a miner."""
+        """Standard mode: uploads the inputs as they are and lets the gateway seal the job to a miner. With `shots`, a
+        storyboard: the shot prompts go in the body's `shots`, next to the scene in `prompt`."""
         inputs = inputs or []
-        mode = mode or infer_mode(i.role for i in inputs)
+        shots = _check_storyboard(shots, inputs, mode, duration_s)
+        mode = Mode.STORYBOARD if shots is not None else (mode or infer_mode(i.role for i in inputs))
         route = self.route(
-            mode, model, family, privacy="standard", resolution=resolution, aspect_ratio=aspect_ratio, fps=fps, duration_s=duration_s
+            mode, model, family, privacy="standard", resolution=resolution, aspect_ratio=aspect_ratio, fps=fps,
+            duration_s=_route_duration(duration_s, shots),
         )
         profile = self.profile(route.profile_id)
-        params = _fit_params(profile, mode, inputs, duration_s, resolution, aspect_ratio, fps, audio, route.fallback_reason)
+        params = _fit_params(profile, mode, inputs, duration_s, resolution, aspect_ratio, fps, audio, route.fallback_reason, shots=shots)
+        _check_shot_prompts(profile, prompt, shots)
         refs = []
         for index, item in enumerate(inputs):
             upload = self.upload_standard(item.role, item.data, item.mime)
@@ -572,6 +622,8 @@ class KunoClient:
             "options": options or {},
             "inputs": refs,
         }
+        if shots is not None:
+            body["shots"] = [{"prompt": shot.prompt} for shot in shots]
         if webhook_url:
             body["webhook_url"] = webhook_url
         status = JobStatus.model_validate(self._request("POST", "/v1/standard/videos", json=body).json())
@@ -587,6 +639,34 @@ class KunoClient:
             prepared.request.params.profile_id,
             prepared.fallback_reason,
         )
+
+    def estimate_price(
+        self,
+        model: str,
+        *,
+        duration_s: float | None = None,
+        shots: Iterable[Shot] | None = None,
+        resolution: str | None = None,
+        aspect_ratio: str | None = None,
+        fps: int | None = None,
+        privacy: Privacy = "private",
+    ) -> float:
+        """What a job on `model` would cost in USD, from the price the gateway publishes (`/v1/models`), for the params
+        `generate` would send given the same settings and no fallback: `profile.price_usd(params, privacy)`. A storyboard
+        (`shots`) costs its stitched seconds. The gateway's charge when the job is accepted is what counts, and every
+        price is a placeholder for now."""
+        if privacy not in ("private", "standard"):
+            raise KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".')
+        shots = _check_storyboard(shots, [], None, duration_s)
+        mode = Mode.TEXT_TO_VIDEO if shots is None else Mode.STORYBOARD
+        profile = self.profile(model)
+        params = _fit_params(profile, mode, [], duration_s, resolution, aspect_ratio, fps, True, None, shots=shots)
+        try:
+            return profile.price_usd(params, privacy)
+        except PrivacyModeUnavailable as exc:
+            raise KunoError(0, "privacy_mode_unavailable", str(exc)) from None
+        except ParamError as exc:
+            raise KunoError(0, "invalid_params", str(exc)) from None
 
     @staticmethod
     def _fitting_route(route: RouteResponse, params: GenerationParams) -> RouteResponse:
@@ -898,8 +978,12 @@ def _fit_params(
     fps: int | None,
     audio: bool,
     fallback_reason: str | None,
+    shots: list[Shot] | None = None,
 ) -> GenerationParams:
-    """Fills defaults from the profile. After a fallback, adapts requested values to the new model."""
+    """Fills defaults from the profile. After a fallback, adapts requested values to the new model.
+
+    For a storyboard (`shots`), each shot's duration gets the clip's default and adaptation, its join the default of
+    `Shot`, and `duration_s` is the stitched length the protocol requires (`storyboard_duration_s`)."""
     lim = profile.limits
     lenient = fallback_reason is not None
     if resolution is None or (lenient and resolution not in lim.sizes):
@@ -911,10 +995,27 @@ def _fit_params(
         fps = lim.default_fps
     # Some profiles render shorter clips at high frame rates (LTX-2.5 Fast goes past 10 s only at 24 or 25 fps).
     max_duration = min(lim.max_duration_s, lim.max_duration_s_by_fps.get(fps, lim.max_duration_s))
-    if duration_s is None:
-        duration_s = min(max(5.0, lim.min_duration_s), max_duration)
-    elif lenient:
-        duration_s = min(max(duration_s, lim.min_duration_s), max_duration)
+
+    def fit_duration(requested: float | None) -> float:
+        if requested is None:
+            return float(min(max(5.0, lim.min_duration_s), max_duration))
+        return float(min(max(requested, lim.min_duration_s), max_duration) if lenient else requested)
+
+    specs = None
+    if shots is not None:
+        try:
+            specs = [
+                ShotSpec(duration_s=fit_duration(shot.duration_s), join=shot.join or ("fresh" if index == 0 else "continue"))
+                for index, shot in enumerate(shots)
+            ]
+        except (ValidationError, TypeError, ValueError):
+            raise KunoError(0, "invalid_shots", 'A shot\'s join is "fresh", "continue" or "cut", and its duration_s a number.') from None
+        try:
+            duration_s = storyboard_duration_s(profile, specs, fps)
+        except ParamError as exc:  # the profile has no storyboard limits
+            raise KunoError(0, "invalid_params", str(exc)) from None
+    else:
+        duration_s = fit_duration(duration_s)
     return GenerationParams(
         profile_id=profile.id,
         mode=mode,
@@ -924,4 +1025,47 @@ def _fit_params(
         fps=fps,
         audio=audio and lim.audio,
         input_roles=[i.role for i in inputs],
+        shots=specs,
     )
+
+
+def _check_storyboard(
+    shots: Iterable[Shot] | None, inputs: list[Input], mode: Mode | str | None, duration_s: float | None
+) -> list[Shot] | None:
+    """The storyboard's shots as a list, after the checks that need no profile; None for any other job."""
+    if shots is None:
+        if mode is not None and Mode(mode) is Mode.STORYBOARD:
+            raise KunoError(0, "invalid_shots", "A storyboard needs its shots: pass shots=[Shot(...), ...].")
+        return None
+    shots = list(shots)
+    if mode is not None and Mode(mode) is not Mode.STORYBOARD:
+        raise KunoError(0, "invalid_shots", f"Only storyboards take shots, not {Mode(mode).value}.")
+    if inputs:
+        raise KunoError(0, "invalid_inputs", "Storyboards take no inputs.")
+    if duration_s is not None:
+        raise KunoError(0, "invalid_params", "A storyboard's length comes from its shots: leave duration_s unset.")
+    for number, shot in enumerate(shots, start=1):
+        if not isinstance(shot, Shot):
+            raise KunoError(0, "invalid_shots", f"Shot {number} is not a Shot.")
+        if not isinstance(shot.prompt, str) or not shot.prompt.strip():
+            raise KunoError(0, "invalid_shots", f"Shot {number} needs a prompt.")
+    return shots
+
+
+def _check_shot_prompts(profile: ModelProfile, scene: str, shots: list[Shot] | None) -> None:
+    """Each shot's model prompt (the scene, a blank line, the shot's prompt) must fit the profile's `max_prompt_chars`.
+    Checked here because in Private mode nobody else can before the job is charged."""
+    limit = profile.limits.max_prompt_chars
+    for number, shot in enumerate(shots or (), start=1):
+        if len(shot_prompt(scene, shot.prompt)) > limit:
+            raise KunoError(
+                0, "prompt_too_long", f"Shot {number}'s prompt, with the scene before it, is over {profile.name}'s {limit}-character limit."
+            )
+
+
+def _route_duration(duration_s: float | None, shots: list[Shot] | None) -> float | None:
+    """What `/v1/route` is asked to fit. A storyboard renders one shot at a time, so its longest shot, among those given a
+    duration; None (any) when none is."""
+    if shots is None:
+        return duration_s
+    return max((shot.duration_s for shot in shots if shot.duration_s is not None), default=None)
