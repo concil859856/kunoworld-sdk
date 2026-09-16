@@ -42,8 +42,17 @@ export type {
   SubmitStage,
   WaitOptions,
 } from "./client.js";
-export { enclaveIdFor, gpuNonceFor, parseTdxQuote, reportDataFor, verifyEvidence } from "./attestation.js";
-export type { Verdict } from "./attestation.js";
+export { enclaveIdFor, gpuNonceFor, manifestSignedFields, parseTdxQuote, reportDataFor, verifyEvidence, verifySignedManifest } from "./attestation.js";
+export type { Verdict, VerifyOptions } from "./attestation.js";
+export {
+  DEFAULT_TCB_STATUSES,
+  NRAS_INTERMEDIATE_SPKI_SHA256,
+  pinnedNrasKey,
+  verifyEndorsedToken,
+  verifyGpuEndorsements,
+  verifyTdxQuoteSignature,
+} from "./endorsements.js";
+export type { EndorsementOptions, Endorsements, GpuCheck, NvidiaJwk, NvidiaResult, QuoteCheck } from "./endorsements.js";
 export {
   BLOB_V1,
   BLOB_V2,

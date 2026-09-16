@@ -6,8 +6,9 @@ enclave-signed receipt; and decrypts the finished video locally. Cryptography us
 so it runs in modern browsers and Node.js 20+. The package is ES modules only.
 
 > **Development preview.** Workers on development gateways use simulated attestation and may
-> return placeholder video. Real TDX and NVIDIA evidence verification is not built yet. Prices
-> are placeholders that haven't been set (`models()` may return `pricing_placeholder: true`).
+> return placeholder video. The TDX and NVIDIA checks below are built and tested against Intel's real sample quotes and
+> NVIDIA's real signing certificates, but no live confidential GPU worker has run yet. Prices are placeholders that
+> haven't been set (`models()` may return `pricing_placeholder: true`).
 
 ## Who this is for
 
@@ -43,8 +44,8 @@ npm install /path/to/kunoworld-sdk/js     # from your own project
 import { KunoClient } from "@kunoworld/sdk";
 import { readFile, writeFile } from "node:fs/promises";
 
-// The golden manifest lists the enclave measurements you trust. Get it from your operator
-// through a trusted channel and pin it, rather than trusting whatever the gateway serves.
+// The golden manifest lists the enclave measurements you trust. Pin it, or pin the subnet owner's public key
+// (`ownerPublicKey`) so the gateway's copy is used only once the owner's signature on it checks out.
 const manifest = JSON.parse(await readFile("./trusted-manifest.json", "utf8"));
 
 const kuno = new KunoClient({
@@ -252,11 +253,22 @@ const result = await kuno.result(handle);
 
 ## Client reference
 
-`new KunoClient({ apiKey, baseUrl, manifest, country, fetch, credentials })` — `baseUrl` defaults
-to `https://api.kunoworld.com` and may be a same-origin path in a browser; `apiKey` is optional
-(leave it out behind a proxy); `fetch` replaces the transport; `country` is for development
-gateways only. `KunoClient.forProxy(baseUrl, opts?)` is the keyless form for a same-origin proxy.
-A `kwt_` studio token is refused with `gone`.
+`new KunoClient({ apiKey, baseUrl, manifest, ownerPublicKey, country, fetch, credentials, nvidiaTrustedSpki,
+tdxAllowedTcbStatuses })` — `baseUrl` defaults to `https://api.kunoworld.com` and may be a same-origin path in a
+browser; `apiKey` is optional (leave it out behind a proxy); `fetch` replaces the transport; `country` is for
+development gateways only. `KunoClient.forProxy(baseUrl, opts?)` is the keyless form for a same-origin proxy. A `kwt_`
+studio token is refused with `gone`.
+
+Verification options:
+- `manifest` pins the golden manifest. `ownerPublicKey` (base64 Ed25519) instead fetches `/v1/manifest/signed` and
+  uses it only if the subnet owner signed it. Without either, the gateway's manifest is trusted.
+- A TDX worker is accepted only with the `endorsements` the gateway relays: its quote must pass full Intel DCAP
+  verification (via `@phala/dcap-qvl`, Intel's root pinned) with a TCB status in `tdxAllowedTcbStatuses` (default
+  `UpToDate`), and its GPUs' NVIDIA attestation tokens must be signed under NVIDIA's attestation intermediate, pinned
+  by SPKI hash. `nvidiaTrustedSpki` replaces that pin when NVIDIA rotates the intermediate (the current one is valid to
+  2029-12-08).
+- The same checks are exported: `verifyEvidence(evidence, manifest, { endorsements })`, `verifyTdxQuoteSignature`,
+  `verifyGpuEndorsements`, `verifySignedManifest`.
 
 | Method | What it does |
 |---|---|

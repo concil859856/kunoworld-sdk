@@ -12,8 +12,9 @@ from typing import Any, Callable, Iterable, Literal, Union
 from urllib.parse import parse_qs, quote
 
 import httpx
+from pydantic import ValidationError
 
-from kuno_protocol.attestation import AttestationEvidence, GoldenManifest, verify_evidence
+from kuno_protocol.attestation import AttestationEvidence, GoldenManifest, SignedManifest, verify_endorsed_evidence
 from kuno_protocol.blobs import decrypt_blob, encrypt_blob
 from kuno_protocol.canonical import b64d, b64e, sha256_hex
 from kuno_protocol.crypto import DecryptionError, SenderSession
@@ -181,12 +182,24 @@ class KunoClient:
         base_url: str = "https://api.kunoworld.com",
         *,
         manifest: GoldenManifest | None = None,
+        owner_public_key: str | bytes | None = None,
         country: str | None = None,
         timeout: float = 60.0,
         transport: httpx.BaseTransport | None = None,
+        nvidia_trusted_spki: list[str] | None = None,
     ):
         """`api_key` is a developer API key from your account page. The KunoWorld website itself uses
-        email sign-in; API keys are for your own programs and must never be shipped to a browser."""
+        email sign-in; API keys are for your own programs and must never be shipped to a browser.
+
+        Verification needs no trust in the gateway once one of these is set:
+        - `manifest`: the published golden manifest, pinned.
+        - `owner_public_key`: the subnet owner's Ed25519 key (base64 or bytes). The gateway's copy of the manifest is
+          used only if the owner's signature on it verifies.
+        Without either, the gateway-served manifest is trusted, with a warning.
+
+        TDX workers are checked in full against what the gateway relays next to their evidence: the quote against
+        Intel's root with Intel's collateral, and the GPUs against NVIDIA-signed attestation results under NVIDIA's
+        pinned intermediate (`nvidia_trusted_spki` replaces that pin when NVIDIA rotates it)."""
         if api_key.startswith("kwt_"):
             raise KunoError(410, "gone", ERROR_CODES["gone"])
         headers = {"authorization": f"Bearer {api_key}"}
@@ -194,7 +207,9 @@ class KunoClient:
             headers["x-kuno-country"] = country
         self._http = httpx.Client(base_url=base_url.rstrip("/"), headers=headers, timeout=timeout, transport=transport)
         self._manifest = manifest
-        self._pinned = manifest is not None
+        self._owner_public_key = b64d(owner_public_key) if isinstance(owner_public_key, str) else owner_public_key
+        self._pinned = manifest is not None or owner_public_key is not None
+        self._nvidia_trusted_spki = nvidia_trusted_spki
 
     # ------------------------------------------------------------ plumbing
 
@@ -237,9 +252,18 @@ class KunoClient:
         raise KunoError(404, "unknown_model", f"Unknown model {profile_id!r}.")
 
     def manifest(self) -> GoldenManifest:
+        if self._manifest is None and self._owner_public_key is not None:
+            try:
+                signed = SignedManifest.model_validate(self._request("GET", "/v1/manifest/signed").json())
+            except ValidationError as exc:
+                raise KunoError(0, "integrity", "The gateway served a malformed signed manifest.") from exc
+            if not signed.verify(self._owner_public_key):
+                raise KunoError(0, "integrity", "The gateway's manifest is not signed by the subnet owner's key.")
+            self._manifest = signed.manifest
         if self._manifest is None:
             warnings.warn(
-                "Using the gateway-served golden manifest. Pin the published manifest for zero-trust verification.",
+                "Using the gateway-served golden manifest. Pin the published manifest or the owner's public key for "
+                "zero-trust verification.",
                 stacklevel=3,
             )
             self._manifest = GoldenManifest.model_validate(self._request("GET", "/v1/manifest").json())
@@ -583,7 +607,7 @@ class KunoClient:
         manifest = self.manifest()
         for enclave in route.enclaves:
             evidence = AttestationEvidence.model_validate(enclave["evidence"])
-            verdict = verify_evidence(evidence, manifest)
+            verdict = verify_endorsed_evidence(evidence, manifest, enclave.get("endorsements"), trusted_spki=self._nvidia_trusted_spki)
             if (
                 verdict.ok
                 and verdict.enclave_id == enclave["enclave_id"]

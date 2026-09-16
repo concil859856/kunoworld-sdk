@@ -1,5 +1,7 @@
 /** Wire types mirroring kuno_protocol (Python). */
 
+import type { Endorsements } from "./endorsements.js";
+
 export type Mode =
   | "text_to_video"
   | "image_to_video"
@@ -280,6 +282,8 @@ export interface EnclaveInfo {
   last_seen: number;
   /** What the worker's hardware can fit, for the profiles it can't serve in full; null or absent: full limits. */
   envelope?: ServingEnvelope | null;
+  /** What Intel and NVIDIA signed for `evidence` (endorsements.ts); null for simulated workers and older gateways. */
+  endorsements?: Endorsements | null;
 }
 
 /** resolution -> aspect ratio -> fps -> the longest duration_s served. A size or frame rate left out is not served. */

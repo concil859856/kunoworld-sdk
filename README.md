@@ -17,7 +17,12 @@ you. A private video's link carries its key in the `#k=` fragment, which never r
 see "Share links" in each README. Key sync between devices and the `/v1/me/*` routes need the
 website's email sign-in, so the SDKs have no methods for them.
 
-**Development preview.** Real Intel TDX and NVIDIA evidence verification is not built yet, so
-today these clients talk to development gateways whose workers use simulated attestation and
-may return placeholder video. The encryption, receipts and verification code paths are the
-real ones. See the subnet repository's `SECURITY.md` for what is and is not protected.
+**What the clients verify.** Before encrypting anything to a worker, both clients check its Intel TDX quote against
+Intel's root and its GPUs' NVIDIA-signed attestation results, using material the gateway relays but can't forge
+(`endorsements`, subnet `PROTOCOL.md`). With the subnet owner's public key they also check the owner's signature on the
+manifest of approved images. Neither step trusts the gateway.
+
+**Development preview.** No confidential GPU worker has run yet, so today these clients talk to development gateways
+whose workers use simulated attestation and may return placeholder video. The TDX and NVIDIA checks are tested
+against Intel's real sample quotes and NVIDIA's real signing certificates, not yet against a live worker. See the subnet
+repository's `SECURITY.md` for what is and is not protected.

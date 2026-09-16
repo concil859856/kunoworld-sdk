@@ -31,8 +31,8 @@ import os
 from kunoworld import KunoClient
 from kuno_protocol.attestation import GoldenManifest
 
-# The golden manifest lists the enclave measurements you trust. Get it from your operator
-# through a trusted channel and pin it, rather than trusting whatever the gateway serves.
+# The golden manifest lists the enclave measurements you trust. Pin it, or pin the subnet owner's public key
+# (owner_public_key=) so the gateway's copy is used only once the owner's signature on it checks out.
 manifest = GoldenManifest.model_validate_json(open("trusted-manifest.json").read())
 
 kuno = KunoClient(os.environ["KUNO_API_KEY"], os.environ["KUNO_GATEWAY_URL"], manifest=manifest)
@@ -48,7 +48,12 @@ with open("my-world.receipt.json", "w") as file:
 print(result.profile_id, result.fallback_reason, result.content_digest)
 ```
 
-Without `manifest=`, the client falls back to the manifest the gateway serves and warns you to pin one.
+Without `manifest=` or `owner_public_key=`, the client falls back to the manifest the gateway serves and warns you.
+
+A TDX worker is accepted only with the `endorsements` the gateway relays next to its evidence: the quote must pass full
+Intel DCAP verification (dcap-qvl, Intel's root pinned) and its GPUs' NVIDIA attestation tokens must be signed under
+NVIDIA's pinned attestation intermediate (`kuno_protocol.endorsements`). Nothing about the hardware is taken on the
+gateway's word.
 
 ## Private or Standard
 
@@ -250,9 +255,10 @@ full control, `kuno.prepare(...)` builds and encrypts a request without sending 
 
 ## Client reference
 
-`KunoClient(api_key, base_url="https://api.kunoworld.com", *, manifest=None, country=None,
-timeout=60.0, transport=None)` — `country` is for development gateways only. Call `close()`
-when you are done.
+`KunoClient(api_key, base_url="https://api.kunoworld.com", *, manifest=None, owner_public_key=None, country=None,
+timeout=60.0, transport=None, nvidia_trusted_spki=None)` — `owner_public_key` (base64 or bytes) checks the owner's
+signature on the gateway's manifest; `nvidia_trusted_spki` replaces NVIDIA's pinned attestation intermediate when
+NVIDIA rotates it; `country` is for development gateways only. Call `close()` when you are done.
 
 | Method | What it does |
 |---|---|

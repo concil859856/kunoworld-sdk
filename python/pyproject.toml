@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "KunoWorld Python SDK: private video generation with end-to-end encryption to attested GPU enclaves"
 requires-python = ">=3.10"
 dependencies = [
-    "kuno-protocol",
+    # [tdx]: clients check TDX quotes against Intel's root themselves (kuno_protocol.endorsements).
+    "kuno-protocol[tdx]",
     "httpx>=0.27",
 ]
 

@@ -1,24 +1,44 @@
 /**
  * Enclave attestation checks, mirroring kuno_protocol.attestation.
  *
- * Mock evidence (development) is fully verified. For Intel TDX the SDK verifies the
- * measurements against the golden manifest and the REPORTDATA key binding; the quote's
- * Intel signature chain and NVIDIA GPU evidence are verified by validators and the
- * gateway (browsers cannot fetch DCAP collateral). `signatureVerified` reports which.
+ * Mock evidence (development) is fully verified. Intel TDX evidence is verified in full here, without trusting the
+ * gateway that served it: the quote's signature chain to Intel's root and its TCB status (with the Intel collateral the
+ * gateway relays), the GPUs' NVIDIA-signed attestation results under NVIDIA's pinned intermediate, the REPORTDATA
+ * binding of keys, nonce and GPU evidence, and the measurements against the golden manifest. TDX evidence without
+ * those endorsements is refused rather than half-checked (endorsements.ts).
  */
 
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { sha256, sha512 } from "@noble/hashes/sha2.js";
 
 import { b64d, canonicalJson, concatBytes, fromHex, toHex, utf8 } from "./encoding.js";
+import {
+  type EndorsementOptions,
+  type Endorsements,
+  type QuoteCheck,
+  verifyGpuEndorsements,
+  verifyTdxQuoteSignature,
+} from "./endorsements.js";
 import type { AttestationEvidence, GoldenManifest } from "./types.js";
 
 export interface Verdict {
   ok: boolean;
   enclaveId: string;
   reasons: string[];
+  /** The quote's signature verified: against a manifest key (mock) or Intel's root with relayed collateral (TDX). */
   signatureVerified: boolean;
   measurements: Record<string, string>;
+  /** TDX: the platform's TCB status and the GPUs NVIDIA attested, once both verified. */
+  tcbStatus?: string;
+  gpuCount?: number;
+}
+
+export interface VerifyOptions extends EndorsementOptions {
+  expectedNonce?: Uint8Array;
+  /** What the gateway relayed with the evidence (`enclave.endorsements`). Required for TDX evidence. */
+  endorsements?: Endorsements | null;
+  /** Replaces Intel DCAP verification of the quote, e.g. with a verifier you run yourself. Tests use it too. */
+  tdxQuoteVerifier?: (quote: Uint8Array, collateral: Record<string, string> | null, opts: EndorsementOptions) => QuoteCheck;
 }
 
 const MEASUREMENT_KEYS = ["mrtd", "rtmr0", "rtmr1", "rtmr2", "rtmr3"] as const;
@@ -50,13 +70,20 @@ const TDX_FIELDS: Array<[string, number]> = [
   ["rtmr0", 48], ["rtmr1", 48], ["rtmr2", 48], ["rtmr3", 48], ["reportdata", 64],
 ];
 
+/** TD report fields of a DCAP v4 or v5 TD quote (v5 adds a body descriptor: TD report 1.0 or 1.5). No signature check. */
 export function parseTdxQuote(quote: Uint8Array): Record<string, string> {
   const bodyLen = TDX_FIELDS.reduce((n, [, size]) => n + size, 0);
-  if (quote.length < 48 + bodyLen) throw new Error("quote too short for a TDX v4 quote");
+  if (quote.length < 48) throw new Error("quote too short for a TDX quote");
   const view = new DataView(quote.buffer, quote.byteOffset, quote.length);
-  if (view.getUint16(0, true) !== 4 || view.getUint32(4, true) !== 0x81) throw new Error("not a TDX v4 quote");
-  const fields: Record<string, string> = {};
+  const version = view.getUint16(0, true);
+  if ((version !== 4 && version !== 5) || view.getUint32(4, true) !== 0x81) throw new Error("not a TDX v4/v5 quote");
   let offset = 48;
+  if (version === 5) {
+    if (quote.length < 54 || ![2, 3].includes(view.getUint16(48, true))) throw new Error("v5 quote body is not a TD report");
+    offset += 6;
+  }
+  if (quote.length < offset + bodyLen) throw new Error(`quote too short for a TDX v${version} quote`);
+  const fields: Record<string, string> = {};
   for (const [name, size] of TDX_FIELDS) {
     fields[name] = toHex(quote.subarray(offset, offset + size));
     offset += size;
@@ -64,11 +91,7 @@ export function parseTdxQuote(quote: Uint8Array): Record<string, string> {
   return fields;
 }
 
-export function verifyEvidence(
-  evidence: AttestationEvidence,
-  manifest: GoldenManifest,
-  opts: { expectedNonce?: Uint8Array; now?: number } = {},
-): Verdict {
+export function verifyEvidence(evidence: AttestationEvidence, manifest: GoldenManifest, opts: VerifyOptions = {}): Verdict {
   const reasons: string[] = [];
   let hpke: Uint8Array, sign: Uint8Array, nonce: Uint8Array, quote: Uint8Array, gpu: Uint8Array | null;
   try {
@@ -107,9 +130,33 @@ export function verifyEvidence(
       const fields = parseTdxQuote(quote);
       verdict.measurements = Object.fromEntries(MEASUREMENT_KEYS.map((k) => [k, fields[k]]));
       reportData = fields.reportdata;
+      if (parseInt(fields.tdattributes.slice(0, 2), 16) & 0x01) reasons.push("TD runs in debug mode, so the host can read its memory");
       if (!gpu) reasons.push("GPU evidence is required on TDX workers");
     } catch (err) {
       reasons.push((err as Error).message);
+    }
+    if (Object.keys(verdict.measurements).length) {
+      const endorsements = opts.endorsements;
+      if (!endorsements) {
+        reasons.push("no endorsements were relayed, so the quote's Intel signature and the GPUs' NVIDIA attestation can't be checked");
+      } else {
+        const quoteCheck = (opts.tdxQuoteVerifier ?? verifyTdxQuoteSignature)(quote, endorsements.tdx_collateral, { ...opts, now });
+        if (quoteCheck.ok) {
+          verdict.signatureVerified = true;
+          verdict.tcbStatus = quoteCheck.status;
+        } else {
+          reasons.push(`TDX quote rejected: ${quoteCheck.detail}`);
+        }
+        if (gpu) {
+          const gpuCheck = verifyGpuEndorsements(gpu, gpuNonceFor(nonce, hpke, sign), endorsements, {
+            maxTokenAgeS: manifest.max_evidence_age_s,
+            ...opts,
+            now,
+          });
+          if (gpuCheck.ok) verdict.gpuCount = gpuCheck.gpuCount;
+          else reasons.push(`GPU evidence rejected: ${gpuCheck.detail}`);
+        }
+      }
     }
   } else {
     reasons.push(`unsupported TEE ${String(evidence.tee)}`);
@@ -162,6 +209,44 @@ function gpuEntryProblems(entry: GoldenManifest["allowed"][number], gpu: Uint8Ar
     problems.push(`the evidence carries ${switches} NVSwitch(es), but the manifest entry requires ${entry.nvswitches_per_enclave} per enclave`);
   }
   return problems;
+}
+
+const OPTIONAL_ENTRY_FIELDS = ["gpu_mode", "gpus_per_enclave", "nvswitches_per_enclave"];
+
+/** kuno_protocol.attestation.GoldenManifest.signed_fields: fields added after signing started are left out when unset. */
+export function manifestSignedFields(manifest: Record<string, unknown>): Record<string, unknown> {
+  const fields: Record<string, unknown> = { ...manifest };
+  if (fields.open_tier === null || fields.open_tier === undefined) delete fields.open_tier;
+  const digests = fields.model_digests as Record<string, unknown> | undefined | null;
+  if (!digests || Object.keys(digests).length === 0) delete fields.model_digests;
+  if (Array.isArray(fields.allowed)) {
+    fields.allowed = fields.allowed.map((entry: Record<string, unknown>) => {
+      const copy = { ...entry };
+      for (const name of OPTIONAL_ENTRY_FIELDS) if (copy[name] === null || copy[name] === undefined) delete copy[name];
+      return copy;
+    });
+  }
+  return fields;
+}
+
+/**
+ * The manifest from `GET /v1/manifest/signed`, returned only if the subnet owner's Ed25519 key signed it. Verifies the
+ * document as received, so fields this SDK doesn't know about are still covered by the signature.
+ */
+export function verifySignedManifest(document: unknown, ownerPublicKey: Uint8Array): GoldenManifest {
+  const doc = document as { manifest?: Record<string, unknown>; signature?: string | null } | null;
+  if (!doc || typeof doc !== "object" || !doc.manifest || typeof doc.manifest !== "object" || typeof doc.signature !== "string") {
+    throw new Error("not an owner-signed manifest");
+  }
+  const message = concatBytes(utf8("kuno/v1/manifest\n"), canonicalJson(manifestSignedFields(doc.manifest)));
+  let signature: Uint8Array;
+  try {
+    signature = b64d(doc.signature);
+  } catch {
+    throw new Error("not an owner-signed manifest");
+  }
+  if (!safeVerify(signature, message, ownerPublicKey)) throw new Error("the manifest is not signed by the subnet owner's key");
+  return doc.manifest as unknown as GoldenManifest;
 }
 
 function safeVerify(signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array): boolean {

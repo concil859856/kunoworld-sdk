@@ -90,10 +90,10 @@ def enclave(envelope: dict | None) -> dict:
 
 
 def test_only_an_enclave_whose_envelope_fits_the_filled_in_params_is_picked(monkeypatch):
-    def verified(evidence, _manifest):  # the evidence checks have their own tests; here every listed worker attests
+    def verified(evidence, _manifest, _endorsements, **_kwargs):  # the evidence checks have their own tests; here every worker attests
         return SimpleNamespace(ok=True, enclave_id=enclave_id_for(b64d(evidence.hpke_public_key), b64d(evidence.signing_public_key)))
 
-    monkeypatch.setattr(client_module, "verify_evidence", verified)
+    monkeypatch.setattr(client_module, "verify_endorsed_evidence", verified)
     _, client = fake_gateway({})
     client._manifest = object()
     small, full = enclave(small_card()), enclave(None)

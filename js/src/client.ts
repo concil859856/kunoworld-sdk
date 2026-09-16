@@ -1,4 +1,4 @@
-import { verifyEvidence, verifySignature } from "./attestation.js";
+import { verifyEvidence, verifySignature, verifySignedManifest } from "./attestation.js";
 import { decryptBlob, encryptBlob, openSenderSession, padPayload, sha256Hex } from "./crypto.js";
 import { b64d, b64e, canonicalJson, concatBytes, utf8 } from "./encoding.js";
 import type {
@@ -191,6 +191,15 @@ export interface KunoClientOptions {
   baseUrl?: string;
   /** Pin the published golden manifest for zero-trust verification. */
   manifest?: GoldenManifest;
+  /**
+   * The subnet owner's Ed25519 public key (base64). The gateway's manifest is then used only if the owner signed it,
+   * which is zero-trust without pinning a manifest that changes with every image release.
+   */
+  ownerPublicKey?: string;
+  /** Replaces the pinned NVIDIA attestation intermediate (SPKI SHA-256, hex) when NVIDIA rotates it. */
+  nvidiaTrustedSpki?: string[];
+  /** TCB statuses a TDX platform may report; default `UpToDate` only. */
+  tdxAllowedTcbStatuses?: string[];
   /** Development only: pretend to be in another country. */
   country?: string;
   /** Replaces `fetch`, e.g. to add timeouts or route requests through your own transport. */
@@ -534,6 +543,14 @@ export class KunoClient {
   }
 
   async manifest(): Promise<GoldenManifest> {
+    if (!this.manifestCache && this.opts.ownerPublicKey) {
+      const document = await this.json<unknown>("GET", "/v1/manifest/signed", undefined, false);
+      try {
+        this.manifestCache = verifySignedManifest(document, b64d(this.opts.ownerPublicKey));
+      } catch (err) {
+        throw new KunoError(0, "integrity", `The gateway's manifest can't be trusted: ${(err as Error).message}.`);
+      }
+    }
     this.manifestCache ??= await this.json<GoldenManifest>("GET", "/v1/manifest", undefined, false);
     return this.manifestCache;
   }
@@ -722,7 +739,11 @@ export class KunoClient {
         tooSmall = true;
         continue;
       }
-      const verdict = verifyEvidence(enclave.evidence, manifest);
+      const verdict = verifyEvidence(enclave.evidence, manifest, {
+        endorsements: enclave.endorsements,
+        nvidiaTrustedSpki: this.opts.nvidiaTrustedSpki,
+        tdxAllowedTcbStatuses: this.opts.tdxAllowedTcbStatuses,
+      });
       if (
         verdict.ok &&
         verdict.enclaveId === enclave.enclave_id &&
