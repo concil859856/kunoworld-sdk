@@ -304,10 +304,11 @@ error body in `details` (with `reasons` and `restrictedUntil` getters). The pack
 The gateway holds a job's price when it is submitted and refunds it automatically if the job
 fails, is blocked (`safety_blocked`), is canceled or times out. `priceUsd(profile, params, privacy)`
 and `priceQuote` estimate that price from a profile: `pricing.usd_per_second` is the Private
-price and `pricing.standard_usd_per_second` the lower Standard one, the fps and long-clip
-multipliers apply to the whole job, and no job costs less than `pricing.min_job_usd`. Full
-MiniMax H3 and H3 Director are Private-only (`privacyModes(profile)` is `["private"]`), so a
-Standard request for them fails with `privacy_mode_unavailable`. All prices are placeholders.
+price and `pricing.standard_usd_per_second` the lower Standard one, the fps multiplier (and, in
+Private mode, the long-clip multiplier) applies to the whole job, and no job costs less than
+`pricing.min_job_usd`. A profile without a Standard price is Private-only (`privacyModes(profile)`
+is `["private"]`), and a Standard request for it fails with `privacy_mode_unavailable`; every
+profile has one today. All prices are placeholders.
 
 ## Develop
 

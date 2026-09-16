@@ -285,5 +285,5 @@ body, with `reasons` and `restricted_until` properties). The gateway holds a job
 when it is submitted and refunds it automatically if the job fails, is blocked (`safety_blocked`),
 is canceled or times out. A profile's `pricing.usd_per_second` is the Private price and
 `pricing.standard_usd_per_second` the lower Standard one (`kuno_protocol` computes a job's price
-with `profile.price_usd(params, privacy)`). Full MiniMax H3 and H3 Director are Private-only, so a
-Standard request for them fails with `privacy_mode_unavailable`. All prices are placeholders.
+with `profile.price_usd(params, privacy)`). A profile without a Standard price is Private-only, and a
+Standard request for it fails with `privacy_mode_unavailable`; every profile has one today. All prices are placeholders.

@@ -249,8 +249,9 @@ export function privacyModes(profile: ModelProfile): PrivacyMode[] {
 
 /**
  * The gateway's price for a job (kuno_protocol `ModelProfile.price_usd`): the per-second rate for the privacy
- * mode x duration x the fps and long-clip multipliers, never below the profile's minimum charge. Null where the
- * profile has no such price: a resolution it doesn't render, or Standard on a Private-only profile.
+ * mode x duration x the fps multiplier (and, in Private mode, the long-clip multiplier), never below the profile's
+ * minimum charge. Null where the profile has no such price: a resolution it doesn't render, or Standard on a
+ * Private-only profile.
  */
 export function priceQuote(
   profile: ModelProfile,
@@ -262,7 +263,9 @@ export function priceQuote(
   const rate = (privacy === "private" ? pricing.usd_per_second : pricing.standard_usd_per_second)?.[params.resolution];
   if (rate === undefined) return null;
   let multiplier = pricing.fps_multipliers?.[String(params.fps)] ?? 1;
-  if (pricing.long_clip && params.duration_s > pricing.long_clip.over_s) multiplier *= pricing.long_clip.multiplier;
+  if (privacy === "private" && pricing.long_clip && params.duration_s > pricing.long_clip.over_s) {
+    multiplier *= pricing.long_clip.multiplier;
+  }
   const raw = rate * params.duration_s * multiplier;
   const minimum = pricing.min_job_usd ?? 0;
   return { usd: Math.round(Math.max(minimum, raw) * 10000) / 10000, usdPerSecond: rate, multiplier, minimumApplied: raw < minimum };

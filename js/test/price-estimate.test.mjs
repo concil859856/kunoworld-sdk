@@ -48,6 +48,12 @@ test("48 and 50 fps multiply the whole job, and long H3 clips cost more", () => 
   assert.equal(priceUsd(H3, job("768p", 12)), 2.88);
 });
 
+test("the long-clip multiplier is Private-only: Standard stays flat per second, like the market's list prices", () => {
+  const turbo = { ...H3, id: "h3-turbo", pricing: { ...H3.pricing, standard_usd_per_second: { "768p": 0.04 } } };
+  assert.equal(priceUsd(turbo, job("768p", 12)), 2.88);
+  assert.deepEqual(priceQuote(turbo, job("768p", 12), "standard"), { usd: 0.48, usdPerSecond: 0.04, multiplier: 1, minimumApplied: false });
+});
+
 test("the minimum charge sets the price of a very short job, and says so", () => {
   assert.deepEqual(priceQuote(FAST, job("720p", 2), "standard"), { usd: 0.1, usdPerSecond: 0.04, multiplier: 1, minimumApplied: true });
   assert.equal(priceQuote(FAST, job("720p", 2)).minimumApplied, false); // 0.05 x 2 is exactly the minimum
