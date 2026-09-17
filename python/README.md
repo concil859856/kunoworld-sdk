@@ -127,6 +127,12 @@ operator credit, no active restriction and fewer than 2 blocked jobs in 30 days.
 | `missing_key` | a private share link had no `#k=` key, and none was passed |
 | `decrypt_failed` | a private video didn't open with the key given |
 | `invalid_key` | an output key isn't 32 bytes of base64url (checked before a link is made) |
+| `rules_not_affirmed` (422, or before sending) | an Element write without `affirm_rules=True` |
+| `invalid_element` (before sending) | an Element draft breaks the rules (name, description, kind, files or consent record), or a use of one doesn't fit the request |
+| `consent_withdrawn` (before sending) | the person in an Element withdrew consent, so `attach` refuses it |
+| `no_vault` / `vault_changed` (409) | key sync is off, or its keys were rotated since this Elements key was derived: get the current key from the studio |
+| `element_exists` / `element_changed` (409) | the Element id is taken, or another device changed the Element since it was read |
+| `elements_full` / `storage_full` (409) | 200 Elements, or 2 GiB of their files, per account |
 
 `ERROR_CODES` maps these codes to a sentence; `err.explanation` reads it, and
 `err.is_content_policy` is true for `content_policy` and `safety_blocked`.
@@ -367,6 +373,93 @@ except KunoError as err:
         print(f"It would cost ${err.details['price_usd']}")
 ```
 
+## Elements: reusable characters, products, locations, styles and voices
+
+An Element is a named character, product, location, style or voice you reuse across videos: 1 to 4 images (or one
+voice clip), a short description the prompt can use ("Mara: a woman in her 60s with short silver hair and a green
+raincoat"), and, for a real person, a consent record. **Everything about it is encrypted on this machine** before it
+reaches KunoWorld, which stores only ciphertext and can't open it. These are the JavaScript SDK's Elements, byte for
+byte: an Element made here opens in the studio and the JavaScript SDK, and theirs open here.
+
+**The rules.** No public figures and no one under 18. A real person must be you, or must have given you permission,
+and their consent record says who, when and for what. Sexual content is banned, as everywhere on KunoWorld. Every write
+affirms these rules (`affirm_rules=True`, `ELEMENT_RULES`); without it nothing is sent (`rules_not_affirmed`).
+
+**The key.** Elements are encrypted with an *Elements key*, derived from the key sync master key the website holds, so
+your other devices open them once key sync is unlocked there. A program gets the key as text from the studio's Elements
+page and keeps it with its other secrets:
+
+```python
+import os
+from kunoworld import ElementConsent, ElementFile, KunoClient, parse_elements_key
+
+kuno = KunoClient(api_key=os.environ["KUNO_API_KEY"])
+key = parse_elements_key(os.environ["KUNO_ELEMENTS_KEY"])   # "kwek1.<account id>.<key id>.<key>"
+
+mara = kuno.elements.create(
+    key,
+    kind="character",                                       # character | product | location | style | voice
+    name="Mara",
+    description="a woman in her 60s with short silver hair and a green raincoat",
+    consent=ElementConsent(subject="Mara Jones", relationship="permission", granted_on="2026-09-01",
+                           use="Videos made on KunoWorld"),  # affirmed_at defaults to now
+    files=[ElementFile.load("mara.jpg")],                   # the type is read from the bytes
+    affirm_rules=True,
+)
+
+listed = kuno.elements.list(key)          # listed.elements, listed.unreadable, listed.key_id, listed.stored_bytes
+```
+
+The Elements key opens Elements only: it is HKDF-SHA256 of the master key, which it can't be turned back into, so it
+opens no video key. **Rotating key sync replaces it**: writes with the old one fail with `vault_changed`, and `list`
+reports Elements it can't open in `unreadable` (`key_rotated`). Get the new key from the studio.
+
+**Using one in a video.** `attach` opens the Element's files here and returns the request with them in it, as the
+studio's composer does: the files go in as inputs in the roles you choose, and each Element's description is added to
+the prompt on its own line. A Private job then seals them to the enclave like any input; a Standard job uploads them
+readable, so KunoWorld and the GPU provider can see them.
+
+```python
+from kunoworld import ElementUse
+
+request = kuno.elements.attach(
+    {"prompt": "She walks along the pier at dusk.", "model": "ltx-2.5-fast"},
+    [ElementUse(mara, "first_frame")],                      # file=0 by default; a keyframe needs time_s
+)
+video = kuno.generate(**request, max_price_usd=2)
+```
+
+- **The request.** `attach` takes `generate`'s keyword arguments and fills `first_frame`, `last_frame`, `keyframes`,
+  `reference_images` and `reference_audio`; a request with an `inputs` list (for `prepare` or `submit_standard`) gets
+  `Input`s appended instead. A single-file role already filled is refused (`invalid_element`), and every use is checked
+  before any file is downloaded.
+- **Which roles.** `element_roles(element, kuno.profile(model_id))` lists what an Element's files can be on a model:
+  images as `first_frame`, `last_frame` or `keyframe` on LTX-2.5, or `reference_image` on MiniMax H3 Director
+  (`file="all"` adds every image); a voice as `reference_audio` on MiniMax H3 Director (`h3-reference`) only. H3 is
+  licensed only in some regions; elsewhere a voice is stored for later and its description still works. Pass an
+  `Element` on its own, or `ElementUse(element)` without a role, to use only the description.
+- **Storyboards** take descriptions only, added to the scene: their shots take no inputs. A plan brings its own scene:
+  add lines to it with `add_element_lines(plan.scene, [mara])` before rendering.
+- **Withdrawn consent.** `kuno.elements.withdraw_consent(key, element, affirm_rules=True)` writes `withdrawn_at` into the
+  sealed record; `attach` then refuses the Element (`consent_withdrawn`). Deleting it removes it for good.
+
+`update(key, element, name=..., description=..., consent=..., kind=..., files=None, affirm_rules=True)` changes what is
+given and keeps the rest (`consent=None` removes the record). Without `files` it keeps the files and their key; with
+`files` it replaces all of them under a new key. It names the revision it read, so a change from another device in
+between fails with `element_changed`. `delete(element_id)` removes the record and files, and `file(element, position)`
+downloads and opens one file, checking it against the digest in the record.
+
+**Limits.** 200 Elements and 2 GiB per account; 4 images or one voice clip (up to 30 seconds) each; 15 MB per file; a
+name of 80 characters and a description of 1,000. 60 changes a minute. `element_draft_problems(kind=..., name=...,
+files=...)` returns the problems with a draft as sentences before anything is sent.
+
+**What KunoWorld sees.** That the account has Elements, their random ids, revisions and times, how many files each has,
+their padded sizes, and when they are downloaded. Not their kind, name, description, consent record or pictures. The
+formats are in `platform/gateway/ELEMENTS.md`; `kunoworld.elements` has the sealing primitives (`derive_elements_key`,
+`seal_element`, `open_element`, `wrap_element_key`, `rewrap_element_key` for a key sync rotation, `record_json`). The
+record's JSON is written as JavaScript writes it, so its padded size doesn't say which SDK wrote it; consent is written
+in the studio's form, with `withdrawnAt` null until it is withdrawn.
+
 ## Routing and fallbacks
 
 Before submitting, the client asks the gateway which model will serve the request. The owner's
@@ -538,9 +631,17 @@ NVIDIA rotates it; `country` is for development gateways only. Call `close()` wh
 | `shares.create(job, expires_at=None)` | make a share link; `url` carries a private `VideoJob`'s key as `#k=...` |
 | `shares.list(job_id=None, limit=100)` / `shares.revoke(share_id)` | your links with `status` and `view_count`, or stop one |
 | `shares.get(link)` / `shares.open(link, key=None)` | public (no credential): a link's details, or its video checked and decrypted |
+| `elements.create(key, *, kind, name, files, description="", consent=None, affirm_rules=False, element_id=None)` | seal and store a new Element |
+| `elements.list(key)` / `elements.get(key, element_id)` / `elements.rows()` | open your Elements (`unreadable` lists any this key can't), one Element, or the stored ciphertext and the vault's `master_key_id` |
+| `elements.update(key, element, *, kind=None, name=None, description=None, consent="keep", files=None, affirm_rules=False)` / `elements.withdraw_consent(key, element, *, affirm_rules=False)` / `elements.delete(element_id)` | replace an Element (keeping its files and key when `files` is None), mark its consent withdrawn, or delete it |
+| `elements.file(element, position=0)` / `elements.attach(request, uses)` | one opened file, or a request with Elements' files as inputs and their descriptions in the prompt |
 
 `share_url_with_key(url, output_key)` adds a private video's key to a link, and
 `parse_share_link(link)` returns `(token, key)`.
+
+Element helpers: `parse_elements_key` / `format_elements_key`, `derive_elements_key`, `element_roles`,
+`element_prompt_line`, `add_element_lines`, `element_draft_problems`, `consent_withdrawn`, `ElementFile.load`, and in
+`kunoworld.elements` the sealing primitives with `ELEMENT_RULES` and `ELEMENT_LIMITS`.
 
 Failures raise `KunoError` with `status`, `code`, `message` and `details` (the rest of the error
 body, with `reasons` and `restricted_until` properties). The gateway holds a job's price

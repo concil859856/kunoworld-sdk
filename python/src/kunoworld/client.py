@@ -9,7 +9,7 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Mapping, Union
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Mapping, Union
 from urllib.parse import parse_qs, quote
 
 import httpx
@@ -53,6 +53,9 @@ from kuno_protocol.schemas import (
 )
 from kuno_protocol.sealed_payload import PayloadTooLarge, seal_payload
 
+if TYPE_CHECKING:
+    from .elements import Elements
+
 Source = Union[str, Path, bytes]
 ProgressFn = Callable[[JobStatus], None]
 Privacy = Literal["private", "standard"]
@@ -90,7 +93,20 @@ ERROR_CODES: dict[str, str] = {
     "missing_key": "A private share link needs the video's key: the #k=... part of the link, or pass it separately.",
     "too_many_shares": "Too many working share links: 20 per video and 1000 per account. Revoke some first.",
     "invalid_expiry": "A share link's expiry must be between a minute and ten years from now, in Unix seconds, or None.",
-    "rate_limited": "Too many requests from this network to public share links. Try again in a minute.",
+    "rate_limited": "Too many requests in the last minute (public share links per network; Elements changes per account). Try again "
+    "in a minute.",
+    "no_vault": "Elements are encrypted with key sync's keys, and key sync isn't set up for this account. Turn it on in the studio.",
+    "vault_changed": "The keys were rotated on another device, or changed while this was being prepared. Get the current key (an "
+    "Elements key starts again from the studio), then retry.",
+    "element_exists": "An Element with this id already exists.",
+    "element_changed": "The Element was changed on another device since it was read. Read it again, then retry.",
+    "elements_full": "The account holds the most Elements it can (200). Delete one first.",
+    "storage_full": "Elements' files use the account's 2 GiB. Delete some first.",
+    "elements_exist": "Key sync can't be turned off while Elements need its keys. Delete the Elements first.",
+    "invalid_element": "The Element doesn't fit the rules: its name, description, kind, files or consent record.",
+    "consent_withdrawn": "The person in this Element withdrew consent, so it can't be used in new videos.",
+    "rules_not_affirmed": "Storing an Element affirms the Elements rules: no public figures, no one under 18, consent for real "
+    "people, nothing sexual.",
     "over_budget": "The gateway's quote for this job is over max_price_usd, so nothing was uploaded, sealed or charged. "
     "`details` has `price_usd` and `max_price_usd`.",
     "invalid_budget": "max_price_usd must be a finite number, zero or more.",
@@ -498,6 +514,14 @@ class KunoClient:
         return self._request("POST", "/v1/reports", json=body, auth=False).json()["report_id"]
 
     # ------------------------------------------------------------ share links
+
+    @property
+    def elements(self) -> Elements:
+        """Elements: characters, products, locations, styles and voices sealed on this machine with an Elements key, so
+        KunoWorld stores only ciphertext (`kunoworld.elements`)."""
+        from .elements import Elements
+
+        return Elements(self)
 
     @property
     def shares(self) -> ShareLinks:

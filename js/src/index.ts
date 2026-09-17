@@ -55,6 +55,8 @@ export type {
   PlanResult,
   PlanRevisionOptions,
   PricedParams,
+  QuoteRequest,
+  QuoteShot,
   StandardJobHandle,
   SubmitStage,
   WaitOptions,

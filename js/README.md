@@ -120,6 +120,10 @@ strikes_24h, strikes_7d }`.
 | `scan_unavailable` (503) | the upload scanner couldn't be reached; nothing was charged, try again |
 | `unsupported_media` (422) | the gateway didn't recognize an upload's type (it reads the bytes, not the content-type) |
 | `content_policy` (422) | a standard job breaks the content policy (all NSFW is banned); not created, nothing charged |
+| `over_budget` (before sending) | the gateway's quote is over `maxPriceUsd`; nothing was read, uploaded, sealed or charged. `err.details` has `price_usd` and `max_price_usd` |
+| `invalid_budget` (before sending) | `maxPriceUsd` isn't an amount of zero or more |
+| `quote_mismatch` (before sending) | the gateway quoted other params than the job about to be sent (routing changed in between); try again |
+| `invalid_shots` / `invalid_inputs` (before sending a quote) | a quote for a storyboard without shots, shots on another mode, or shots with inputs |
 | `safety_blocked` | the in-enclave content check stopped the job; it counts as a strike |
 | `bad_output` | the video didn't match its receipt, so the job failed and was refunded |
 | `deleted` / `removed` (410) | the video was deleted by its owner, or removed after review |
@@ -281,7 +285,9 @@ const { video } = await kuno.wait(job, {
   0) renders with seed `(seed + i) mod 2^31`.
 - **Price.** You pay the per-second rate for the stitched length, with the fps multiplier. The long-clip multiplier and
   the workers' serving envelopes look at the longest shot, since shots render one at a time (`renderDurationS(params)`);
-  `priceQuote`, `envelopeFits` and routing do the same.
+  `priceQuote`, `envelopeFits` and routing do the same. `kuno.quote({ model: "ltx-2.5-fast", shots, resolution: "720p" })`
+  asks the gateway for the exact price without sending a prompt ([Prices, quotes and budgets](#prices-quotes-and-budgets)),
+  and `maxPriceUsd` caps it.
 - **Checked before sending.** `submit` refuses a storyboard that breaks these rules with `invalid_params`, before
   anything is sealed or sent; `validateStoryboard(profile, params)` runs the same checks with kuno_protocol's messages.
 - **Not verified yet.** Storyboards carry no step commitment, so validators don't step-audit them yet.
@@ -332,12 +338,64 @@ const job = await kuno.submit({
   `shots` (numbered from 1) only those shots are rewritten and only their lengths move. The plan may be edited first: it
   is sent with exactly Plan v1's fields and its stitched length measured again, and one that breaks the rules is refused
   as `invalid_plan` before anything is sent.
-- **Price.** Flat, whatever the length: `priceQuote(profile, { mode: "plan", resolution, duration_s, fps }, privacy)`
-  or `planPriceUsd(profile, privacy)`. `plan_failed` (the planner wrote nothing usable) and `safety_blocked` are refunded.
+- **Price.** Flat, whatever the length: `kuno.quote({ model: "ltx-2.5-fast", mode: "plan", durationS: 30 })` asks the
+  gateway (`breakdown.planUsd`), `priceQuote(profile, { mode: "plan", resolution, duration_s, fps }, privacy)` or
+  `planPriceUsd(profile, privacy)` estimate it here, and `maxPriceUsd` on `plan` and `revisePlan` works as for videos.
+  `plan_failed` (the planner wrote nothing usable) and `safety_blocked` are refunded.
 - **Waiting.** Plans take seconds to about a minute (stages `planning`, then `checking`). `submitPlan` returns a
   `PlanHandle` (a Private one holds the output key: store it like a password), and `waitPlan(handle)` finishes it.
 - **Checks shared with Python.** `planContext`, `fitPlan`, `validatePlan`, `briefQuotes`, `missingQuotes`, `openPlan` and
   `encodePlan` port `kuno_protocol.plans`, and the shared `plans` vectors pin them.
+
+## Prices, quotes and budgets
+
+`kuno.quote(request)` asks the gateway for the exact price of a job before anything is encrypted or sent
+(`POST /v1/quote`). It routes the request as the job would be routed (fallbacks, licence regions, capacity), fills in the
+same defaults `submit` does, and prices those params with the function that charges the job. A `GenerateRequest` can
+be passed as it is: only its shape is read, and its prompt, shot prompts and files never leave this process.
+
+```js
+const quote = await kuno.quote({
+  model: "ltx-2.5-fast",
+  resolution: "720p",
+  shots: [{ durationS: 5 }, { durationS: 5 }, { durationS: 5, join: "cut" }],
+});
+console.log(quote.priceUsd, quote.profileId, quote.fallbackReason);   // 1.645 ltx-2.5-fast null
+console.log(quote.breakdown);   // usdPerSecond, billableSeconds (stitched), fpsMultiplier, longClipMultiplier, minJobUsd…
+console.log(quote.params);      // the GenerationParams priced
+console.log(quote.balanceUsd, quote.balanceCovers, quote.placeholder);
+```
+
+- **What it takes.** `model`, `family`, `mode`, `durationS`, `shots` (`{ durationS, join }`, or `ShotSpec`s),
+  `resolution`, `aspectRatio`, `fps`, `audio`, `privacy`, and `inputRoles` (or `inputs`, whose files aren't read) for
+  the inputs the job will send. The mode follows from those roles as `submit` infers it; without any, the inputs the
+  mode needs are assumed. `mode: "plan"` with `durationS` (the target) quotes a plan: flat, with `breakdown.planUsd` and
+  `usdPerSecond` null. `plan` quotes rendering that plan as its storyboard.
+- **Refusals** carry the code the job itself would get: `invalid_params`, `privacy_mode_unavailable`,
+  `region_restricted`, `model_disabled`, `no_capacity` (with `max_duration_s` when no worker's hardware fits),
+  `private_mode_not_eligible` and `account_restricted`. A shape that can't be a job is refused before sending
+  (`invalid_shots`, `invalid_inputs`, `invalid_privacy`).
+- **A quote holds nothing.** The price is taken when the job is accepted. If routing or prices change in between, the
+  job is priced again the same way. `priceQuote(profile, params)` estimates a price locally from `models()`, without
+  routing.
+
+**Budgets.** Pass `maxPriceUsd` in a request to `submit` or `generate` (videos and storyboards, Private or Standard), to
+`plan` or `submitPlan`, or in the options of `revisePlan` or `submitRevision`. After routing and filling in the params,
+the client has the gateway quote exactly those params, and throws `over_budget` when the price is over the limit:
+no input is read or uploaded, no worker is picked, nothing is sealed, submitted or charged, and `err.details` has
+`price_usd` and `max_price_usd`. A price equal to the limit goes ahead, and the handle keeps the quote as `quote`. A
+quote for other params than the job (routing changed in between) is `quote_mismatch`; a limit that isn't an amount of
+zero or more is `invalid_budget`, before anything is sent. The Python SDK's `max_price_usd` works the same way.
+
+```js
+try {
+  const job = await kuno.submit({ prompt, model: "ltx-2.5-fast", durationS: 10, maxPriceUsd: 1.0 });
+  console.log(`Quoted $${job.quote.priceUsd}`);
+} catch (err) {
+  if (err instanceof KunoError && err.code === "over_budget") console.log(`It would cost $${err.details.price_usd}`);
+  else throw err;
+}
+```
 
 ## Elements: reusable characters, products, locations and voices
 
@@ -453,12 +511,13 @@ Verification options:
 | `models(maxAgeMs = 15000)` | model profiles, availability and the switch; cached for 15 s |
 | `manifest()` | the golden manifest the gateway serves |
 | `route(mode, model?, family?, privacy?, fit?)` | which profile and enclaves would serve a request; `fit` (`resolution`, `aspectRatio`, `fps`, `durationS`) lists only workers whose hardware can fit it (their serving envelope). `submit` sends the request's own fields |
-| `submit(request, onStage?)` | private: route, verify evidence, encrypt, upload; returns a `JobHandle`. Standard (`privacy: "standard"`): upload inputs, create; returns a `StandardJobHandle`. `onStage` reports `routing`, `verifying`, `encrypting`, `uploading`, `submitting` |
+| `submit(request, onStage?)` | private: route, verify evidence, encrypt, upload; returns a `JobHandle`. Standard (`privacy: "standard"`): upload inputs, create; returns a `StandardJobHandle`. `onStage` reports `routing`, `verifying`, `encrypting`, `uploading`, `submitting`. With `maxPriceUsd`, `over_budget` before anything is sent when the quote is over it; the handle keeps the `quote` |
 | `generate(request, { onStage, ...waitOptions })` | `submit` then `wait` |
 | `wait(handle, { onProgress, signal, pollMs, timeoutMs })` | poll to completion, then fetch the video (verified and decrypted for private jobs) |
 | `result(handle, status?)` | fetch a finished job's video |
-| `plan(request, { onStage, ...waitOptions })` / `submitPlan(request, onStage?)` | a storyboard plan from `{ brief, targetS, model?, resolution?, aspectRatio?, fps?, audio?, style?, privacy?, seed? }`: waited for and checked (`PlanResult`: `plan`, `json`, `receipt`), or its `PlanHandle` |
-| `revisePlan(plan, instruction?, { shots, brief, style, privacy, seed, ...waitOptions })` / `submitRevision(...)` | the plan rewritten: only the listed shots, or all of them |
+| `plan(request, { onStage, ...waitOptions })` / `submitPlan(request, onStage?)` | a storyboard plan from `{ brief, targetS, model?, resolution?, aspectRatio?, fps?, audio?, style?, privacy?, seed?, maxPriceUsd? }`: waited for and checked (`PlanResult`: `plan`, `json`, `receipt`), or its `PlanHandle` |
+| `revisePlan(plan, instruction?, { shots, brief, style, privacy, seed, maxPriceUsd, ...waitOptions })` / `submitRevision(...)` | the plan rewritten: only the listed shots, or all of them |
+| `quote(request)` | the gateway's exact price for such a job now, as a `Quote`: `priceUsd`, `profileId`, `fallbackReason`, `params`, `breakdown`, `placeholder`, `balanceUsd`, `balanceCovers`. Never sends a prompt or file |
 | `waitPlan(handle, waitOptions)` / `planResult(handle, status?)` | wait for a plan job, or open a finished one |
 | `status(jobId)` / `list(limit = 50)` | job status (including `privacy`), or your recent jobs |
 | `cancel(jobId)` | request cancellation. Stopping polling does not cancel a job |
@@ -496,8 +555,8 @@ error body in `details` (with `reasons` and `restrictedUntil` getters). The pack
 `tdx`, so a private job is never sealed to an open-tier miner.
 
 The gateway holds a job's price when it is submitted and refunds it automatically if the job
-fails, is blocked (`safety_blocked`), is canceled or times out. `priceUsd(profile, params, privacy)`
-and `priceQuote` estimate that price from a profile: `pricing.usd_per_second` is the Private
+fails, is blocked (`safety_blocked`), is canceled or times out. `quote(request)` asks the gateway for it exactly;
+`priceUsd(profile, params, privacy)` and `priceQuote` estimate it from a profile: `pricing.usd_per_second` is the Private
 price and `pricing.standard_usd_per_second` the lower Standard one, the fps multiplier (and, in
 Private mode, the long-clip multiplier) applies to the whole job, and no job costs less than
 `pricing.min_job_usd`. A profile without a Standard price is Private-only (`privacyModes(profile)`

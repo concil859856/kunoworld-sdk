@@ -7,6 +7,8 @@ dependencies = [
     # [tdx]: clients check TDX quotes against Intel's root themselves (kuno_protocol.endorsements).
     "kuno-protocol[tdx]",
     "httpx>=0.27",
+    # Elements are sealed with AES-GCM and HKDF here, not through kuno-protocol (kunoworld.elements).
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]

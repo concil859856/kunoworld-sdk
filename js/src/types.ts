@@ -146,6 +146,48 @@ export interface PriceQuote {
   minimumApplied: boolean;
 }
 
+/**
+ * How the gateway reached a quoted price, in `ModelProfile.price_usd`'s order: `usdPerSecond` × `billableSeconds` (a
+ * storyboard's stitched seconds) × `fpsMultiplier` × `longClipMultiplier` (Private only, past `longClipOverS` of the
+ * longest render) = `subtotalUsd`, and never less than `minJobUsd` (`minimumApplied`). A plan's price is flat: `planUsd`,
+ * with `usdPerSecond` null and `billableSeconds` 0.
+ */
+export interface PriceBreakdown {
+  usdPerSecond: number | null;
+  billableSeconds: number;
+  fpsMultiplier: number;
+  longClipMultiplier: number;
+  subtotalUsd: number;
+  minJobUsd: number;
+  minimumApplied: boolean;
+  longClipOverS: number | null;
+  planUsd: number | null;
+}
+
+/**
+ * The gateway's exact price for a job (`POST /v1/quote`, from `kuno.quote`): what it would hold if the job were submitted
+ * now, for `params` on `profileId` (after any fallback, which `fallbackReason` names). Not an estimate: `priceQuote`
+ * computes one locally.
+ */
+export interface Quote {
+  priceUsd: number;
+  currency: string;
+  privacy: PrivacyMode;
+  profileId: string;
+  profileName: string;
+  requestedProfileId: string | null;
+  fallbackReason: string | null;
+  /** The params priced: a job that sends exactly these is charged `priceUsd`. */
+  params: GenerationParams;
+  breakdown: PriceBreakdown;
+  /** True while prices are placeholders. */
+  placeholder: boolean;
+  /** The account's balance, or null when no working credential was sent. */
+  balanceUsd: number | null;
+  /** Whether the balance covers the price; null without a balance. */
+  balanceCovers: boolean | null;
+}
+
 export interface ModelProfile {
   id: string;
   family: "minimax-h3" | "ltx-2.5" | string;

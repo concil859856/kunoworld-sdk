@@ -1,7 +1,9 @@
 // Elements in the TypeScript SDK: the Elements key derived from key sync, element keys wrapped and records and files
-// sealed and padded, a vector sealed by Python (kuno_protocol and the cryptography package) opening here, and the client
-// against a fake gateway: only ciphertext and ids sent, files kept or replaced, rotation re-wraps, and Elements attached
-// to a request as ordinary inputs plus prompt lines.
+// sealed and padded, a vector sealed by Python (kuno_protocol and the cryptography package) opening here, the Python SDK
+// (kunoworld.elements) sealing the same bytes as this one and each SDK's Elements opening in the other
+// (data/elements_sdk_vectors.json, shared with sdk/python/tests), and the client against a fake gateway: only ciphertext
+// and ids sent, files kept or replaced, rotation re-wraps, and Elements attached to a request as ordinary inputs plus
+// prompt lines.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -22,6 +24,7 @@ import {
   formatElementsKey,
   openElement,
   openElementFile,
+  openElementRecord,
   parseElementsKey,
   rewrapElementKey,
   sealElement,
@@ -32,6 +35,7 @@ import {
 } from "../dist/index.js";
 
 const vector = JSON.parse(readFileSync(new URL("./data/elements_vector.json", import.meta.url), "utf8"));
+const SDK_VECTORS = JSON.parse(readFileSync(new URL("./data/elements_sdk_vectors.json", import.meta.url), "utf8"));
 const ACCOUNT = "0123456789abcdef0123456789abcdef";
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...new TextEncoder().encode("a green raincoat".repeat(30))]);
 const WAV = new Uint8Array([...new TextEncoder().encode("RIFF\0\0\0\0WAVEfmt "), ...new Uint8Array(400)]);
@@ -63,6 +67,63 @@ test("a Python-sealed Element opens here with the key sync master key", () => {
   );
   assert.deepEqual(openElementFile(element.elementKey, element.elementId, 0, b64d(vector.sealed_file_0), element.files[0]), b64d(vector.file_0));
   assert.equal(b64d(vector.row.meta).length, vector.meta_sealed_bytes, "the record is padded to 4 KiB");
+});
+
+/** Runs `fn` with the randomness replaced by the vectors' byte stream: 0, 1, 2, …, 255, 0, … in the order it is drawn. */
+function withCounterRandomness(fn) {
+  const real = crypto.getRandomValues;
+  let n = 0;
+  crypto.getRandomValues = (array) => {
+    for (let i = 0; i < array.length; i++) array[i] = (n + i) % 256;
+    n += array.length;
+    return array;
+  };
+  try {
+    return fn();
+  } finally {
+    crypto.getRandomValues = real;
+  }
+}
+
+test("the Python SDK seals exactly these bytes, and each SDK's Elements open in the other", () => {
+  const v = SDK_VECTORS;
+  const key = deriveElementsKey(b64d(v.master_key), v.account_id, v.master_key_id);
+  assert.equal(b64e(key.key), v.elements_key);
+  assert.equal(formatElementsKey(key), v.elements_key_text);
+  const files = Object.fromEntries(Object.entries(v.files).map(([name, data]) => [name, b64d(data)]));
+  const draftOf = (draft) => ({ ...draft, files: (draft.files ?? []).map(({ file, ...rest }) => ({ data: files[file], ...rest })) });
+
+  const sealed = [];
+  for (const c of v.deterministic) {
+    const kept = sealed[c.keep_files_of];
+    const s = withCounterRandomness(() =>
+      kept
+        ? sealElement(key, c.element_id, { ...draftOf(c.draft), files: [] }, { elementKey: kept.elementKey, keepFiles: kept.record.files })
+        : sealElement(key, c.element_id, draftOf(c.draft)),
+    );
+    sealed.push(s);
+    assert.equal(b64e(s.elementKey), c.element_key, c.name);
+    assert.equal(s.wrappedKey, c.wrapped_key, c.name);
+    assert.equal(s.meta, c.meta, c.name);
+    assert.deepEqual(s.files.map(b64e), c.sealed_files, c.name);
+    const json = text(unpadPayload(decryptBlob(s.elementKey, `element/${c.element_id}/meta`, b64d(s.meta))));
+    assert.equal(json, c.record_json, c.name);
+  }
+  // The text cases: trimmed as JavaScript trims, a file name cut at 200 UTF-16 units, withdrawal written in the record.
+  assert.equal(sealed[0].record.name, "Mára Jó 🎬");
+  assert.match(v.deterministic[0].record_json, /smiling\\u001c"/);
+  assert.match(v.deterministic[0].record_json, /\\ud83c"/);
+  assert.equal(sealed[2].record.consent.withdrawnAt, 1790000000.5);
+
+  for (const [who, made] of [["Python", v.sealed_by_python], ["JavaScript", v.sealed_by_javascript]]) {
+    const element = openElement(key, made.row);
+    assert.equal(JSON.stringify(openElementRecord(element.elementKey, element.elementId, made.row.meta)), made.record_json, who);
+    assert.equal(element.name, "Mára Jó 🎬", who);
+    assert.equal(element.consent.subject, "Mára Jó", who);
+    made.files.forEach((name, position) => {
+      assert.deepEqual(openElementFile(element.elementKey, element.elementId, position, b64d(made.sealed_files[position]), element.files[position]), files[name], who);
+    });
+  }
 });
 
 test("the Elements key is bound to its account and travels as text", () => {

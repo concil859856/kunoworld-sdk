@@ -43,6 +43,7 @@ import type {
   ModelsResponse,
   PriceQuote,
   PrivacyMode,
+  Quote,
   Provenance,
   Receipt,
   ReportRequest,
@@ -113,6 +114,12 @@ export interface GenerateRequest {
    * the prompt, inputs and video; no client-side encryption.
    */
   privacy?: PrivacyMode;
+  /**
+   * The most this job may cost, in USD. After routing and filling in the params, the gateway quotes exactly those params
+   * (`POST /v1/quote`), and a price over it throws `over_budget` before any input is read, uploaded or sealed, or
+   * anything is charged. A price equal to it goes ahead, and the handle keeps the quote.
+   */
+  maxPriceUsd?: number | null;
 }
 
 /** Everything needed to fetch and open a private video later. Store it like a password. */
@@ -126,6 +133,8 @@ export interface JobHandle {
   createdAt: number;
   /** Absent on handles saved before standard mode; they are private. */
   privacy?: "private";
+  /** The gateway's quote the job was checked against, when it was submitted with `maxPriceUsd`. */
+  quote?: Quote;
 }
 
 /** A standard job. It holds no secrets: the account's credentials fetch the video. */
@@ -136,6 +145,8 @@ export interface StandardJobHandle {
   profileId: string;
   fallbackReason: string | null;
   createdAt: number;
+  /** The gateway's quote the job was checked against, when it was submitted with `maxPriceUsd`. */
+  quote?: Quote;
 }
 
 export type AnyJobHandle = JobHandle | StandardJobHandle;
@@ -170,6 +181,8 @@ export interface PlanRequest {
   /** `private` (default): sealed here to an attested enclave that writes plans. `standard`: readable by KunoWorld. */
   privacy?: PrivacyMode;
   seed?: number;
+  /** The most the plan may cost, in USD: `over_budget` before anything is sealed or sent when the gateway's quote is over it. */
+  maxPriceUsd?: number | null;
 }
 
 /** A revision of a plan: a new plan job with the same frame and target. */
@@ -182,6 +195,8 @@ export interface PlanRevisionOptions {
   /** Default: the privacy the plan was made in, else `private`. */
   privacy?: PrivacyMode;
   seed?: number;
+  /** The most the revision may cost, in USD, as for `plan`. */
+  maxPriceUsd?: number | null;
 }
 
 /** A plan job in flight. A Private one holds its output key, the only key that opens the plan: store it like a password. */
@@ -198,6 +213,8 @@ export interface PlanHandle {
   maxShotS: number | null;
   fallbackReason: string | null;
   createdAt: number;
+  /** The gateway's quote the plan was checked against, when it was submitted with `maxPriceUsd`. */
+  quote?: Quote;
 }
 
 /** A finished plan, opened and checked against its receipt and the plan rules. */
@@ -208,6 +225,31 @@ export interface PlanResult {
   json: Uint8Array;
   receipt: Receipt;
   privacy: PrivacyMode;
+}
+
+/** A storyboard shot as a quote sees it: its length and join. A `prompt` may be there (a `GenerateShot`); it is never sent. */
+export type QuoteShot = { durationS?: number | null; join?: ShotJoin | null; prompt?: string } | ShotSpec;
+
+/**
+ * The shape of a job to price (`kuno.quote`): a `GenerateRequest` works as it is, and its prompt, files and seed are never
+ * sent. Only the roles of `inputs` are read; `inputRoles` names them without files. `mode: "plan"` with `durationS` (the
+ * target length) prices a plan job, flat. `plan` prices rendering that plan as its storyboard.
+ */
+export interface QuoteRequest {
+  model?: string;
+  family?: string;
+  mode?: Mode;
+  durationS?: number;
+  shots?: QuoteShot[];
+  resolution?: string;
+  aspectRatio?: string;
+  fps?: number;
+  audio?: boolean;
+  /** The roles of the inputs the job will send, in order. Without these or `inputs`, the gateway assumes what the mode needs. */
+  inputRoles?: InputRole[];
+  inputs?: Array<Pick<GenerateInput, "role">>;
+  privacy?: PrivacyMode;
+  plan?: Plan;
 }
 
 export type SubmitStage = "routing" | "verifying" | "encrypting" | "uploading" | "submitting";
@@ -357,6 +399,132 @@ function routeFit(req: Pick<GenerateRequest, "resolution" | "aspectRatio" | "fps
   const durationS = req.shots?.length ? Math.max(...req.shots.map((shot) => shot.durationS)) : req.durationS;
   return { resolution: req.resolution, aspectRatio: req.aspectRatio, fps: req.fps, durationS };
 }
+
+// ------------------------------------------------------------ quotes and budgets (POST /v1/quote)
+
+/** `maxPriceUsd` is absent, or an amount of zero or more. Throws `invalid_budget`. */
+function checkBudget(maxPriceUsd: unknown): void {
+  if (maxPriceUsd === undefined || maxPriceUsd === null) return;
+  if (typeof maxPriceUsd !== "number" || !Number.isFinite(maxPriceUsd) || maxPriceUsd < 0) {
+    throw new KunoError(0, "invalid_budget", ERROR_CODES.invalid_budget);
+  }
+}
+
+const SHOT_JOINS: readonly unknown[] = ["fresh", "continue", "cut"];
+
+/** A quote's shots after the checks that need no profile (the Python SDK's, with its codes), or null for any other job. */
+function checkQuoteShots(shots: QuoteShot[] | undefined, mode: Mode | undefined, durationS: number | undefined): QuoteShot[] | null {
+  if (shots == null) {
+    if (mode === "storyboard") throw new KunoError(0, "invalid_shots", "A storyboard needs its shots: pass shots: [{ durationS, join }, ...].");
+    return null;
+  }
+  if (mode !== undefined && mode !== "storyboard") throw new KunoError(0, "invalid_shots", `Only storyboards take shots, not ${mode}.`);
+  if (durationS !== undefined) throw new KunoError(0, "invalid_params", "A storyboard's length comes from its shots: leave durationS unset.");
+  shots.forEach((shot, i) => {
+    if (!shot || typeof shot !== "object") throw new KunoError(0, "invalid_shots", `Shot ${i + 1} is not a shot.`);
+    if (shot.join != null && !SHOT_JOINS.includes(shot.join)) throw new KunoError(0, "invalid_shots", `Shot ${i + 1}'s join is "fresh", "continue" or "cut".`);
+  });
+  return shots;
+}
+
+/** A quote shot's length: `durationS` (a `GenerateShot`) or `duration_s` (a `ShotSpec`); null for the default. */
+function shotLength(shot: QuoteShot): number | null {
+  const { durationS } = shot as { durationS?: number | null };
+  return durationS ?? (shot as Partial<ShotSpec>).duration_s ?? null;
+}
+
+/** A plan as the storyboard it renders as, for a quote. A plan brings its own shots and length, and a frame given next to it must be its own. */
+function planShape(plan: Plan, req: QuoteRequest): Pick<QuoteRequest, "model" | "resolution" | "aspectRatio" | "fps" | "audio" | "shots"> {
+  if (!plan || typeof plan !== "object" || !Array.isArray(plan.shots)) {
+    throw new KunoError(0, "invalid_plan", "plan takes a Plan, as plan() or revisePlan() return it (parsePlan reads JSON).");
+  }
+  if (req.shots != null || req.durationS !== undefined) {
+    throw new KunoError(0, "invalid_params", "A plan brings its own shots and length: pass no shots or durationS with it.");
+  }
+  if (req.mode !== undefined && req.mode !== "storyboard") throw new KunoError(0, "invalid_params", `A plan renders as a storyboard, not ${req.mode}.`);
+  for (const [name, given, own] of [
+    ["model", req.model, plan.profile_id],
+    ["resolution", req.resolution, plan.resolution],
+    ["aspect ratio", req.aspectRatio, plan.aspect_ratio],
+    ["fps", req.fps, plan.fps],
+  ] as const) {
+    if (given !== undefined && given !== own) throw new KunoError(0, "invalid_params", `The plan was written for ${name} ${own}, not ${given}.`);
+  }
+  return {
+    model: plan.profile_id,
+    resolution: plan.resolution,
+    aspectRatio: plan.aspect_ratio,
+    fps: plan.fps,
+    audio: plan.audio,
+    shots: plan.shots.map((shot) => ({ durationS: shot.duration_s, join: shot.join })),
+  };
+}
+
+interface QuoteWire {
+  price_usd: number;
+  currency?: string;
+  privacy: PrivacyMode;
+  profile_id: string;
+  profile_name?: string | null;
+  requested_profile_id?: string | null;
+  fallback_reason?: string | null;
+  params: GenerationParams;
+  breakdown?: Partial<Record<string, number | boolean | null>>;
+  placeholder?: boolean;
+  balance_usd?: number | null;
+}
+
+function parseQuote(data: QuoteWire): Quote {
+  const price = Number(data.price_usd);
+  const b = data.breakdown ?? {};
+  // A plan's price is flat: a gateway may leave out the per-second terms, which then read as no rate and no multiplier.
+  const num = (key: string, fallback: number | null) => (typeof b[key] === "number" ? (b[key] as number) : fallback);
+  const balance = typeof data.balance_usd === "number" ? data.balance_usd : null;
+  return {
+    priceUsd: price,
+    currency: data.currency ?? "USD",
+    privacy: data.privacy,
+    profileId: data.profile_id,
+    profileName: data.profile_name ?? "",
+    requestedProfileId: data.requested_profile_id ?? null,
+    fallbackReason: data.fallback_reason ?? null,
+    params: data.params,
+    breakdown: {
+      usdPerSecond: num("usd_per_second", null),
+      billableSeconds: num("billable_seconds", 0)!,
+      fpsMultiplier: num("fps_multiplier", 1)!,
+      longClipMultiplier: num("long_clip_multiplier", 1)!,
+      subtotalUsd: num("subtotal_usd", price)!,
+      minJobUsd: num("min_job_usd", 0)!,
+      minimumApplied: b.minimum_applied === true,
+      longClipOverS: num("long_clip_over_s", null),
+      planUsd: num("plan_usd", null),
+    },
+    placeholder: data.placeholder ?? true,
+    balanceUsd: balance,
+    balanceCovers: balance === null ? null : balance >= price,
+  };
+}
+
+/** Whether two `GenerationParams` are the same job, as kuno_protocol's model compares them (absent defaults and shots included). */
+function sameParams(a: GenerationParams, b: GenerationParams): boolean {
+  const normal = (p: GenerationParams) =>
+    JSON.stringify([
+      p.profile_id,
+      p.mode,
+      p.duration_s,
+      p.resolution,
+      p.aspect_ratio,
+      p.fps,
+      p.audio ?? true,
+      p.input_roles ?? [],
+      p.shots == null ? null : p.shots.map((shot) => [shot.duration_s, shot.join]),
+    ]);
+  return normal(a) === normal(b);
+}
+
+/** A price as Python's `:g` writes it: six significant digits, no trailing zeros. */
+const usd = (n: number) => String(Number(n.toPrecision(6)));
 
 // ------------------------------------------------------------ storyboards (kuno_protocol.profiles)
 
@@ -920,13 +1088,84 @@ export class KunoClient {
   }
 
   /**
+   * The gateway's exact price for a job shaped like this (`POST /v1/quote`): what it would hold if the job were submitted
+   * now, after routing (fallbacks, regions, capacity) and the defaults `submit` fills in. Takes a request's shape and
+   * never its prompt, shot prompts or files: a `GenerateRequest` can be passed as it is. The mode follows the inputs'
+   * roles as `submit` infers it (none given: the gateway assumes what the mode needs). Refusals carry the code the job
+   * itself would get (`invalid_params`, `privacy_mode_unavailable`, `region_restricted`, `no_capacity`,
+   * `private_mode_not_eligible`...); shapes that can't be a job are refused before sending (`invalid_shots`,
+   * `invalid_inputs`, `invalid_privacy`).
+   *
+   * `mode: "plan"` with `durationS` (the target) quotes a plan job: a flat price, whatever the target. `plan` quotes
+   * rendering that plan as its storyboard (only its shots' lengths and joins are sent).
+   */
+  async quote(req: QuoteRequest = {}): Promise<Quote> {
+    const privacy = req.privacy ?? "private";
+    if (privacy !== "private" && privacy !== "standard") throw new KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".');
+    const shape = req.plan !== undefined ? planShape(req.plan, req) : req;
+    const roles = req.inputRoles ?? req.inputs?.map((input) => input.role);
+    const shots = checkQuoteShots(shape.shots, req.mode, req.durationS);
+    if (shots && roles?.length) throw new KunoError(0, "invalid_inputs", "Storyboards take no inputs.");
+    const mode = shots ? "storyboard" : req.mode ?? (roles ? inferMode(roles) : undefined);
+    const body: Record<string, unknown> = { privacy, audio: shape.audio ?? true };
+    const fields: Array<[string, unknown]> = [
+      ["profile_id", shape.model],
+      ["family", req.family],
+      ["mode", mode],
+      ["duration_s", req.durationS],
+      ["resolution", shape.resolution],
+      ["aspect_ratio", shape.aspectRatio],
+      ["fps", shape.fps],
+    ];
+    for (const [key, value] of fields) if (value !== undefined && value !== null) body[key] = value;
+    if (roles) body.input_roles = roles;
+    // Each shot's length and join only: prompts stay here.
+    if (shots) body.shots = shots.map((shot) => ({ duration_s: shotLength(shot), join: shot.join ?? null }));
+    return parseQuote(await this.json<QuoteWire>("POST", "/v1/quote", body));
+  }
+
+  /**
+   * With `maxPriceUsd`, the gateway's quote for exactly these params, refusing `over_budget` when its price is over it.
+   * Every field is sent, on the routed profile, so the gateway fills nothing in and prices the job as it will be sent.
+   */
+  private async withinBudget(params: GenerationParams, privacy: PrivacyMode, maxPriceUsd: number | null | undefined): Promise<Quote | null> {
+    if (maxPriceUsd === undefined || maxPriceUsd === null) return null;
+    const body: Record<string, unknown> = {
+      profile_id: params.profile_id,
+      mode: params.mode,
+      privacy,
+      resolution: params.resolution,
+      aspect_ratio: params.aspect_ratio,
+      fps: params.fps,
+      audio: params.audio,
+      input_roles: params.input_roles,
+    };
+    if (params.shots != null) body.shots = params.shots;
+    else body.duration_s = params.duration_s;
+    const quote = parseQuote(await this.json<QuoteWire>("POST", "/v1/quote", body));
+    if (!sameParams(quote.params, params)) throw new KunoError(0, "quote_mismatch", ERROR_CODES.quote_mismatch, { quote: quote.params });
+    if (quote.priceUsd > maxPriceUsd) {
+      throw new KunoError(
+        0,
+        "over_budget",
+        `This video costs $${usd(quote.priceUsd)} (${quote.profileName || quote.profileId}, ${privacy}), over the $${usd(maxPriceUsd)} limit. Nothing was uploaded, sealed or charged.`,
+        { price_usd: quote.priceUsd, max_price_usd: maxPriceUsd, profile_id: quote.profileId },
+      );
+    }
+    return quote;
+  }
+
+  /**
    * Private (default): routes, verifies the enclave, encrypts inputs in this process, seals and
-   * submits. Standard: uploads the inputs as they are and lets the gateway seal the job.
+   * submits. Standard: uploads the inputs as they are and lets the gateway seal the job. With
+   * `maxPriceUsd`, the gateway quotes the exact params about to be sent, and a price over it throws
+   * `over_budget` before any input is read or uploaded, a worker is picked, or anything is sealed or charged.
    */
   submit(req: GenerateRequest & { privacy: "standard" }, onStage?: (stage: SubmitStage) => void): Promise<StandardJobHandle>;
   submit(req: GenerateRequest & { privacy?: "private" }, onStage?: (stage: SubmitStage) => void): Promise<JobHandle>;
   submit(req: GenerateRequest, onStage?: (stage: SubmitStage) => void): Promise<AnyJobHandle>;
   async submit(req: GenerateRequest, onStage?: (stage: SubmitStage) => void): Promise<AnyJobHandle> {
+    checkBudget(req.maxPriceUsd);
     return req.privacy === "standard" ? this.submitStandard(req, onStage) : this.submitPrivate(req, onStage);
   }
 
@@ -946,6 +1185,7 @@ export class KunoClient {
     if (!profile) throw new KunoError(404, "unknown_model", `Unknown model ${route.profile_id}.`);
     const params = fitParams(profile, mode, roles, req, route.fallback_reason);
     checkStoryboardRequest(profile, params, req);
+    const quote = await this.withinBudget(params, "standard", req.maxPriceUsd);
 
     const refs: Array<Record<string, unknown>> = [];
     for (const [index, input] of inputs.entries()) {
@@ -985,6 +1225,7 @@ export class KunoClient {
       profileId: status.params?.profile_id ?? profile.id,
       fallbackReason: route.fallback_reason,
       createdAt: status.created_at ?? Date.now() / 1000,
+      ...(quote ? { quote } : {}),
     };
   }
 
@@ -1012,6 +1253,7 @@ export class KunoClient {
     if (!profile) throw new KunoError(404, "unknown_model", `Unknown model ${route.profile_id}.`);
     const params = fitParams(profile, mode, roles, req, route.fallback_reason);
     checkStoryboardRequest(profile, params, req);
+    const quote = await this.withinBudget(params, "private", req.maxPriceUsd);
 
     onStage?.("verifying");
     const enclave = await this.pickEnclave(route, params);
@@ -1079,6 +1321,7 @@ export class KunoClient {
       profileId: profile.id,
       fallbackReason: route.fallback_reason,
       createdAt: Date.now() / 1000,
+      ...(quote ? { quote } : {}),
     };
   }
 
@@ -1212,8 +1455,8 @@ export class KunoClient {
    * Submits a plan job and returns its handle. Private (default): routes only to attested workers that list `plan/1`,
    * asks for shots no longer than the longest such a worker renders at this size and frame rate, and seals the brief and
    * style here. Standard: `POST /v1/standard/plans`, readable by KunoWorld. Refused before anything is sent: an empty or
-   * too long brief (`brief_required`, `prompt_too_long`), a target out of range (`invalid_params`), or no plan worker
-   * (`plans_unavailable`).
+   * too long brief (`brief_required`, `prompt_too_long`), a target out of range (`invalid_params`), no plan worker
+   * (`plans_unavailable`), or a quote over `maxPriceUsd` (`over_budget`).
    */
   async submitPlan(req: PlanRequest, onStage?: (stage: SubmitStage) => void): Promise<PlanHandle> {
     return this.startPlan(req, null, onStage);
@@ -1245,6 +1488,7 @@ export class KunoClient {
       style: opts.style,
       privacy: opts.privacy,
       seed: opts.seed,
+      maxPriceUsd: opts.maxPriceUsd,
     };
     return this.startPlan(req, { plan, instruction, shots: opts.shots ?? null }, onStage);
   }
@@ -1326,6 +1570,7 @@ export class KunoClient {
   private async startPlan(req: PlanRequest, revision: PlanRevision | null, onStage?: (stage: SubmitStage) => void): Promise<PlanHandle> {
     const privacy: PrivacyMode = req.privacy ?? "private";
     if (privacy !== "private" && privacy !== "standard") throw new KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".');
+    checkBudget(req.maxPriceUsd);
     if (typeof req.brief !== "string" || (!revision && !req.brief.trim())) throw new KunoError(0, "brief_required", ERROR_CODES.brief_required);
     if (typeof req.targetS !== "number" || !Number.isFinite(req.targetS)) throw new KunoError(0, "invalid_params", "targetS is the plan's length in seconds.");
 
@@ -1382,6 +1627,7 @@ export class KunoClient {
       throw new KunoError(503, "no_capacity", `No worker can plan shots for this size and frame rate: ${(err as Error).message}.`);
     }
     if (revise) checkRevision(revise, context);
+    const quote = await this.withinBudget(params, privacy, req.maxPriceUsd);
 
     if (privacy === "standard") {
       onStage?.("submitting");
@@ -1396,7 +1642,7 @@ export class KunoClient {
       });
       return {
         kind: "plan", jobId: status.job_id, privacy: "standard", profileId: status.params?.profile_id ?? profile.id, enclaveId: status.enclave_id ?? "",
-        maxShotS, fallbackReason: route.fallback_reason, createdAt: status.created_at ?? Date.now() / 1000,
+        maxShotS, fallbackReason: route.fallback_reason, createdAt: status.created_at ?? Date.now() / 1000, ...(quote ? { quote } : {}),
       };
     }
 
@@ -1419,6 +1665,7 @@ export class KunoClient {
     return {
       kind: "plan", jobId, privacy: "private", profileId: profile.id, enclaveId: enclave.enclave_id, outputKey: b64e(session.outputKey),
       signingPublicKey: enclave.signing_public_key, maxShotS, fallbackReason: route.fallback_reason, createdAt: Date.now() / 1000,
+      ...(quote ? { quote } : {}),
     };
   }
 
