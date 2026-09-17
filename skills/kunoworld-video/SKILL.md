@@ -1,6 +1,6 @@
 ---
 name: kunoworld-video
-description: Make videos with sound, privately, with KunoWorld (LTX-2.5 and MiniMax H3), including long storyboards of up to 12 shots and 120 s. Use when the user asks to generate, animate or storyboard a video or clip, wants a video made without the provider seeing the prompt or the result, or asks what a video would cost. Covers quoting before spending, Private vs Standard mode, writing prompts for LTX-2.5 and H3, planning storyboard shots and joins, and the content rules. Works through the kunoworld MCP tools or the kunoworld Python SDK.
+description: Make videos with sound, privately, with KunoWorld (LTX-2.5 and MiniMax H3), including long storyboards of up to 12 shots and 120 s. Use when the user asks to generate, animate or storyboard a video or clip, wants a video made without the provider seeing the prompt or the result, or asks what a video would cost. Covers quoting before spending, Private vs Standard mode, writing prompts for LTX-2.5 and H3, planning storyboard shots and joins (yourself, or with a plan written from a brief inside the enclave), and the content rules. Works through the kunoworld MCP tools or the kunoworld Python SDK.
 ---
 
 # KunoWorld video
@@ -72,6 +72,29 @@ Keep shots to 11 s or less at 720p, the most today's 96 GB workers take (4 s at 
 workers, and the quote says `no_capacity` when none is online. Each `continue` or `cut` join trims 17 frames (about
 0.7 s at 24 fps), so the video is a little shorter than its shots added up, and the price is for the stitched seconds.
 While it renders, `get_job` shows `shot 3/8`. Planning and examples: [references/storyboards.md](references/storyboards.md).
+
+### A plan from a brief
+
+`plan_video` has a confidential worker write the storyboard from the user's brief: a title, a scene and 2 to 12 shots
+with prompts, lengths and joins, fitted to `target_s` (4 to 120 s). Nothing renders. It's optional: you can write the
+shots yourself as above, which costs nothing and keeps the brief out of another model.
+
+1. A plan costs a flat price whatever its length (`list_models` shows `plan.usd`), under the same budget rule:
+   `max_price_usd` or the server's cap. Tell the user before planning.
+2. `plan_video` waits (plans take seconds to about a minute) and returns the plan, its `plan_id`, and `render_price`,
+   the quote for rendering it. With `wait=false`, follow it with `get_job`.
+3. Show the user the scene and the shots, the stitched length, `repairs` (what the code changed, such as shots
+   shortened to fit) and the render price. The planner is a small model: its plans are first drafts, and it nearly
+   always picks `cut` joins; suggest `continue` where one unbroken take suits the story.
+4. To change it, `revise_plan` with `plan_id`, an instruction and, for single shots, `shots` (numbered from 1); the
+   other shots come back unchanged. To edit text yourself, pass the edited plan as `plan` to `revise_plan`, or render your
+   edit with `generate_video` using its `scene` as `prompt` and its `shots`.
+5. Render with `generate_video` and `plan_id` (and `max_price_usd` at the agreed render price). It renders in the plan's
+   privacy mode unless told otherwise.
+
+In Private mode the brief is sealed on the user's computer and the plan is opened there; the finished plan is kept in
+the local job store so it can be revised or rendered by id. `plan_failed` means the planner wrote nothing usable: it is
+refunded, so rephrase the brief (shorter, concrete, with the length and what happens) and try again.
 
 ## Content rules (both modes)
 

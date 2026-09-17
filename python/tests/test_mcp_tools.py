@@ -267,3 +267,114 @@ def test_cancel_and_bad_job_ids(setup):
         with pytest.raises(ToolFailure) as refused:
             tool("../jobs")
         assert refused.value.code == "invalid_job_id"
+
+
+# ---------------------------------------------------------------- plans
+
+BRIEF = 'A 30-second ad for a small coffee roastery, warm and handmade. End on "Roasted this morning."'
+
+
+def test_planning_needs_a_budget_and_over_budget_nothing_is_created(setup):
+    network, tools, _ = setup
+    with pytest.raises(ToolFailure) as refused:
+        tools.plan_video(BRIEF)
+    assert refused.value.code == "budget_required" and network.calls == []
+    with pytest.raises(ToolFailure) as refused:
+        tools.plan_video(BRIEF, max_price_usd=0.05)
+    assert refused.value.code == "over_budget" and "This plan would cost $0.1" in refused.value.message
+    assert network.paths() == ["POST /v1/quote"] and tools.store.records() == []
+
+
+def test_a_private_plan_through_the_tools_revised_and_rendered_by_its_id(setup):
+    network, tools, config = setup
+    planned = tools.plan_video(BRIEF, target_s=30, style="35mm film", max_price_usd=1)
+    plan_id = planned["plan_id"]
+    assert (planned["status"], planned["mode"], planned["privacy"], planned["target_s"], planned["can_download"]) == ("succeeded", "plan", "private", 30, False)
+    compact = planned["plan"]
+    assert abs(compact["stitched_s"] - 30) <= 0.5 and compact["settings"]["model"] == FAST.id and compact["repairs"]
+    assert [shot["shot"] for shot in compact["shots"]] == list(range(1, len(compact["shots"]) + 1))
+    assert planned["render_price"]["price_usd"] == round(0.12 * compact["stitched_s"], 4)
+    # The brief and style were sealed; the handle keeps the key and, once finished, the plan, but never the brief.
+    assert b"roastery" not in network.sent() and b"35mm film" not in network.sent()
+    handle = Path(planned["handle_file"])
+    saved = json.loads(handle.read_text())
+    assert mode_of(handle) == 0o600 and saved["output_key"] and saved["kind"] == "plan" and saved["plan"]["title"] == compact["title"]
+    assert BRIEF not in handle.read_text()
+    assert "output_key" not in json.dumps(planned)
+
+    # Only shot 2 is rewritten.
+    revised = tools.revise_plan("darker, at night", plan_id=plan_id, shots=[2], max_price_usd=1)
+    shots = revised["plan"]["shots"]
+    assert revised["plan_id"] != plan_id and "darker, at night" in shots[1]["prompt"]
+    assert [s for s in shots if s["shot"] != 2] == [s for s in compact["shots"] if s["shot"] != 2]
+
+    # The plan an agent edited comes back in the same shape.
+    edited = json.loads(json.dumps(revised["plan"]))
+    edited["shots"][0]["prompt"] = "Extreme close-up; beans tumble into the cooler. The drum hums."
+    again = tools.revise_plan("warmer light", plan=edited, shots=[3], max_price_usd=1)
+    assert again["plan"]["shots"][0]["prompt"] == edited["shots"][0]["prompt"]
+
+    rendered = tools.generate_video(plan_id=again["plan_id"], max_price_usd=10)
+    job = network.jobs[rendered["job_id"]]
+    final = again["plan"]
+    assert (rendered["mode"], rendered["privacy"], job.params.duration_s) == ("storyboard", "private", final["stitched_s"])
+    assert job.payload.prompt == final["scene"] and [s.prompt for s in job.payload.shots] == [s["prompt"] for s in final["shots"]]
+    assert [(s.duration_s, s.join) for s in job.params.shots] == [(s["duration_s"], s["join"]) for s in final["shots"]]
+    assert json.loads(Path(rendered["handle_file"]).read_text())["plan_id"] == again["plan_id"]
+
+    # A plan isn't a video; plans list with their titles.
+    with pytest.raises(ToolFailure) as refused:
+        tools.download_video(plan_id)
+    assert refused.value.code == "not_a_video"
+    listed = {j["job_id"]: j for j in tools.list_jobs(limit=10)["jobs"]}
+    assert listed[plan_id]["mode"] == "plan" and listed[plan_id]["plan_title"] == compact["title"]
+    assert listed[rendered["job_id"]]["plan_id"] == again["plan_id"]
+
+
+def test_a_plan_left_running_is_opened_by_get_job(setup):
+    network, tools, _ = setup
+    started = tools.plan_video(BRIEF, target_s=20, privacy="standard", max_price_usd=1, wait=False)
+    assert started["status"] == "queued" and "get_job" in started["next"] and "plan" not in started
+    assert tools.get_job(started["plan_id"])["stage"] == "planning"
+    tools.get_job(started["plan_id"])
+    done = tools.get_job(started["plan_id"])
+    assert done["status"] == "succeeded" and done["plan"]["privacy"] == "standard" and done["render_price"]["privacy"] == "standard"
+    assert "output_key" not in json.loads(Path(started["handle_file"]).read_text())
+    # A Standard plan renders in Standard unless told otherwise.
+    assert tools.generate_video(plan_id=started["plan_id"], max_price_usd=10)["privacy"] == "standard"
+
+
+def test_plans_that_cant_be_used_say_why(setup):
+    network, tools, _ = setup
+    network.plan_failure = "plan_failed"
+    failed = tools.plan_video(BRIEF, max_price_usd=1)
+    assert (failed["status"], failed["error_code"], failed["refunded"]) == ("failed", "plan_failed", True)
+    assert "rephrase" in failed["next"] and "plan" not in failed
+    for call, code in (
+        (lambda: tools.generate_video(plan_id=failed["plan_id"], max_price_usd=5), "not_ready"),
+        (lambda: tools.generate_video(plan_id=str(uuid.uuid4()), max_price_usd=5), "unknown_plan"),
+        (lambda: tools.generate_video(plan_id="nope", max_price_usd=5), "invalid_plan_id"),
+        (lambda: tools.generate_video(max_price_usd=5), "prompt_required"),
+        (lambda: tools.revise_plan("x", max_price_usd=1), "invalid_plan"),
+        (lambda: tools.revise_plan("x", plan={"shots": []}, max_price_usd=1), "invalid_plan"),
+    ):
+        with pytest.raises(ToolFailure) as refused:
+            call()
+        assert refused.value.code == code
+
+    network.plan_failure = None
+    plan_id = tools.plan_video(BRIEF, max_price_usd=1)["plan_id"]
+    with pytest.raises(KunoError) as conflicting:
+        tools.generate_video("another scene", plan_id=plan_id, max_price_usd=5)
+    assert conflicting.value.code == "invalid_params"
+
+    network.enclave["features"] = []
+    with pytest.raises(KunoError) as unavailable:
+        tools.plan_video(BRIEF, max_price_usd=1)
+    assert unavailable.value.code == "plans_unavailable" and "POST /v1/videos" not in network.paths()[-3:]
+
+
+def test_list_models_shows_plan_prices(setup):
+    network, tools, _ = setup
+    fast = {m["id"]: m for m in tools.list_models()["models"]}[FAST.id]
+    assert fast["plan"] == {"target_s": {"min": 4, "max": 120}, "max_brief_chars": 4000, "max_style_chars": 500, "usd": {"private": 0.1, "standard": 0.08}}

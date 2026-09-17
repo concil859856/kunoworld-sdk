@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 import time
@@ -8,18 +9,22 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Union
+from typing import Any, Callable, Iterable, Literal, Mapping, Union
 from urllib.parse import parse_qs, quote
 
 import httpx
-from pydantic import ValidationError
+from pydantic import PrivateAttr, ValidationError
 
 from kuno_protocol.attestation import AttestationEvidence, GoldenManifest, SignedManifest, verify_endorsed_evidence
 from kuno_protocol.blobs import decrypt_blob, encrypt_blob
 from kuno_protocol.canonical import b64d, b64e, sha256_hex
 from kuno_protocol.crypto import DecryptionError, SenderSession
+from kuno_protocol import plans as protocol_plans
 from kuno_protocol.envelope import fits as envelope_fits
+from kuno_protocol.envelope import max_duration as envelope_max_duration
+from kuno_protocol.envelope import profile_max_duration
 from kuno_protocol.media import sniff_mime
+from kuno_protocol.plans import PLAN_FEATURE, PLAN_OPTION, PlanError, PlanOptions, PlanRevision, encode_plan, open_plan, plan_context
 from kuno_protocol.profiles import (
     InputRole,
     Mode,
@@ -28,6 +33,7 @@ from kuno_protocol.profiles import (
     PrivacyModeUnavailable,
     shot_prompt,
     storyboard_duration_s,
+    validate_params,
 )
 from kuno_protocol.receipts import Receipt, verify_receipt
 from kuno_protocol.schemas import (
@@ -90,6 +96,13 @@ ERROR_CODES: dict[str, str] = {
     "invalid_budget": "max_price_usd must be a finite number, zero or more.",
     "quote_mismatch": "The gateway quoted different params from the job about to be sent (routing changed in between), so "
     "nothing was sent. Try again.",
+    "plan_failed": "The planner couldn't write a usable plan for this brief. The plan was refunded; try rephrasing the brief.",
+    "plans_unavailable": "No confidential worker that writes plans (feature plan/1) is available, so nothing was sent or charged.",
+    "invalid_plan": "The plan doesn't keep to its model's rules (shots, lengths, joins or text limits), so it wasn't sent.",
+    "brief_required": "A plan needs a brief: what the video is for, what happens and how it should feel.",
+    "invalid_brief": "A Standard plan needs a brief; only a revision may leave it empty.",
+    "invalid_options": "The plan options don't fit the job (the longest shot, the shot counts, or the plan to revise).",
+    "envelope_exceeded": "The chosen worker's hardware doesn't serve this size and frame rate. Nothing was charged; ask for a route again.",
 }
 
 
@@ -160,6 +173,45 @@ class Shot:
     join: ShotJoin | None = None
 
 
+class Plan(protocol_plans.Plan):
+    """A storyboard written from a brief inside the enclave (PROTOCOL.md "Plans (Director)"): a first draft to edit, then
+    render with `client.generate(plan=plan)`. Plan v1 as `kuno_protocol.plans.Plan` defines it, plus what this SDK knows
+    about the job that wrote it.
+
+    `scene` is what every shot shares and becomes the storyboard's prompt; each shot has a `beat` (a label), a `prompt`, a
+    `duration_s` on the model's grid and a `join`. `duration_s` is the stitched length of the shots, exactly, and
+    `repairs` lists every change code made to what the planner wrote. Shots are editable; `revise_plan` rewrites some or
+    all of them in the enclave, and recomputes `duration_s` from edited shot lengths before it sends the plan."""
+
+    _job_id: str | None = PrivateAttr(default=None)
+    _receipt: Receipt | None = PrivateAttr(default=None)
+    _privacy: Privacy | None = PrivateAttr(default=None)
+
+    @property
+    def job_id(self) -> str | None:
+        """The plan job that wrote it, or None for a plan loaded from JSON."""
+        return self._job_id
+
+    @property
+    def receipt(self) -> Receipt | None:
+        """The enclave-signed receipt of the plan job: `receipt.body.plan` and a `content_digest` of this plan's JSON."""
+        return self._receipt
+
+    @property
+    def privacy(self) -> Privacy | None:
+        return self._privacy
+
+    def to_shots(self) -> list[Shot]:
+        """The shots as `generate(shots=...)` takes them. With `scene` as the prompt and the plan's model, size, frame rate
+        and sound, they render as this storyboard exactly: the same shot specs and the same stitched `duration_s`."""
+        return [Shot(prompt=shot.prompt, duration_s=shot.duration_s, join=shot.join) for shot in self.shots]
+
+    def to_json(self) -> str:
+        """The plan as canonical JSON (what the enclave delivered, when it is unedited). `Plan.model_validate_json` reads
+        it back."""
+        return encode_plan(self).decode()
+
+
 def infer_mode(roles: Iterable[InputRole]) -> Mode:
     present = set(roles)
     if InputRole.SOURCE_AUDIO in present:
@@ -215,9 +267,10 @@ class PreparedJob:
 class PriceBreakdown:
     """How the price was reached, in `ModelProfile.price_usd`'s order: `usd_per_second` × `billable_seconds` (a
     storyboard's stitched seconds) × `fps_multiplier` × `long_clip_multiplier` (Private only, past `long_clip_over_s` of
-    the longest render) = `subtotal_usd`, and never less than `min_job_usd` (`minimum_applied`)."""
+    the longest render) = `subtotal_usd`, and never less than `min_job_usd` (`minimum_applied`). A plan's price is flat:
+    `plan_usd`, with `usd_per_second` None and `billable_seconds` 0."""
 
-    usd_per_second: float
+    usd_per_second: float | None
     billable_seconds: float
     fps_multiplier: float
     long_clip_multiplier: float
@@ -225,6 +278,7 @@ class PriceBreakdown:
     min_job_usd: float
     minimum_applied: bool
     long_clip_over_s: float | None = None
+    plan_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -253,12 +307,17 @@ class Quote:
     @classmethod
     def from_json(cls, data: dict) -> Quote:
         fields = PriceBreakdown.__dataclass_fields__
+        price = float(data["price_usd"])
+        # A plan's price is flat: a gateway may leave out the per-second terms, which then read as no rate and no multiplier.
+        flat = {"usd_per_second": None, "billable_seconds": 0.0, "fps_multiplier": 1.0, "long_clip_multiplier": 1.0,
+                "subtotal_usd": price, "min_job_usd": 0.0, "minimum_applied": False}
+        given = data.get("breakdown") or {}
         return cls(
-            price_usd=float(data["price_usd"]),
+            price_usd=price,
             privacy=data["privacy"],
             profile_id=data["profile_id"],
             params=GenerationParams.model_validate(data["params"]),
-            breakdown=PriceBreakdown(**{k: v for k, v in data["breakdown"].items() if k in fields}),
+            breakdown=PriceBreakdown(**{**flat, **{k: v for k, v in given.items() if k in fields}}),
             placeholder=bool(data.get("placeholder", True)),
             fallback_reason=data.get("fallback_reason"),
             requested_profile_id=data.get("requested_profile_id"),
@@ -481,7 +540,7 @@ class KunoClient:
 
     def generate(
         self,
-        prompt: str,
+        prompt: str | None = None,
         *,
         model: str | None = None,
         family: str | None = None,
@@ -508,6 +567,7 @@ class KunoClient:
         timeout: float = 1800.0,
         on_progress: ProgressFn | None = None,
         max_price_usd: float | None = None,
+        plan: protocol_plans.Plan | None = None,
     ) -> GenerationResult | VideoJob | StandardVideoJob:
         """`privacy="private"` (default) encrypts on this machine to an attested confidential enclave.
         `privacy="standard"` sends the prompt and inputs to KunoWorld readable: KunoWorld and the
@@ -517,11 +577,21 @@ class KunoClient:
         `prompt` is the scene they share (characters, place, style), which may be empty. Its `duration_s` is computed
         from the shots (`kuno_protocol.profiles.storyboard_duration_s`), so leave `duration_s` unset; it takes no inputs.
 
+        With `plan` (from `plan` or `revise_plan`, edited or not), the plan renders as that storyboard: its scene is the
+        prompt, its shots the shots, and its model, size, frame rate and sound the job's. Pass no prompt, shots or
+        duration; a model, resolution, aspect ratio or frame rate given must match the plan's.
+
         With `max_price_usd`, the gateway quotes the exact params about to be sent (`POST /v1/quote`), and a price over it
         raises `over_budget` before any input is uploaded or anything is sealed or charged."""
         if privacy not in ("private", "standard"):
             raise KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".')
         _check_budget(max_price_usd)
+        if plan is not None:
+            prompt, shots, model, resolution, aspect_ratio, fps, audio = _plan_request(
+                plan, prompt, shots, duration_s, mode, model, resolution, aspect_ratio, fps
+            )
+        elif prompt is None:
+            raise KunoError(0, "invalid_params", "Pass a prompt, or plan= to render a plan.")
         inputs: list[Input] = []
         if first_frame is not None:
             inputs.append(Input.load(InputRole.FIRST_FRAME, first_frame))
@@ -729,9 +799,198 @@ class KunoClient:
             prepared.fallback_reason,
         )
 
+    # ------------------------------------------------------------ plans (Director)
+
+    def plan(
+        self,
+        brief: str,
+        *,
+        target_s: float,
+        model: str | None = "ltx-2.5-fast",
+        resolution: str | None = None,
+        aspect_ratio: str | None = None,
+        fps: int | None = None,
+        audio: bool = True,
+        style: str | None = None,
+        privacy: Privacy = "private",
+        seed: int | None = None,
+        max_price_usd: float | None = None,
+        wait: bool = True,
+        timeout: float = 600.0,
+        on_progress: ProgressFn | None = None,
+    ) -> Plan | PlanJob:
+        """Plans a storyboard from a brief (PROTOCOL.md "Plans (Director)"): a scene and 2-12 shots fitted to `target_s`
+        seconds, written inside a confidential worker by the model's bundled planner. Nothing renders; edit the plan, then
+        render it with `generate(plan=plan)`. A plan costs a flat price whatever its length (`quote(model, mode="plan",
+        duration_s=target_s)`), and a failed one (`plan_failed`, `safety_blocked`) is refunded.
+
+        `privacy="private"` (default) seals the brief and style on this machine to an attested enclave that advertises
+        `plan/1`, and opens the sealed plan here: nobody else reads either. `privacy="standard"` sends them to KunoWorld
+        readable, which checks them and stores the plan in your history.
+
+        The shots are planned no longer than the longest shot a routable worker renders at this size and frame rate, the
+        rule the storyboard is routed by. Waits for the plan (`wait=False` returns a `PlanJob`); plans take seconds to a
+        minute. A plan is a first draft from a small model: read it before you render."""
+        job = self._start_plan(
+            brief, target_s=target_s, model=model, resolution=resolution, aspect_ratio=aspect_ratio, fps=fps, audio=audio,
+            style=style, privacy=privacy, seed=seed, max_price_usd=max_price_usd,
+        )
+        return job.wait(timeout=timeout, on_progress=on_progress) if wait else job
+
+    def revise_plan(
+        self,
+        plan: protocol_plans.Plan | Mapping[str, Any] | str,
+        instruction: str = "",
+        shots: Iterable[int] | None = None,
+        *,
+        brief: str = "",
+        style: str | None = None,
+        privacy: Privacy | None = None,
+        seed: int | None = None,
+        max_price_usd: float | None = None,
+        wait: bool = True,
+        timeout: float = 600.0,
+        on_progress: ProgressFn | None = None,
+    ) -> Plan | PlanJob:
+        """Rewrites a plan in the enclave under `instruction` ("make it darker", "end on a close-up"). With `shots`
+        (numbered from 1) only those shots are rewritten: the title, scene, notes and every other shot come back unchanged,
+        and only the rewritten shots' lengths move. Without it the whole plan is rewritten. A revision is a plan job with
+        the same frame and target as `plan`, at the plan price.
+
+        `plan` is a `Plan` (edited or not: its `duration_s` is recomputed from the shots' lengths), its dict or its JSON. It
+        must keep the plan rules, or `invalid_plan` is raised before anything is sent. `brief`, when given, lets the
+        planner check the brief's quoted words again. `privacy` defaults to the plan's own, else Private."""
+        try:
+            if isinstance(plan, str):
+                loaded = Plan.model_validate_json(plan)
+            elif isinstance(plan, protocol_plans.Plan):
+                loaded = Plan.model_validate(plan.model_dump())
+                loaded._privacy = getattr(plan, "_privacy", None)
+            else:
+                loaded = Plan.model_validate(plan)
+        except (ValidationError, ValueError) as exc:
+            raise KunoError(0, "invalid_plan", f"That isn't a Plan v1: {exc}") from None
+        if privacy is None:
+            privacy = loaded.privacy or "private"
+        numbers = None if shots is None else list(shots)
+        job = self._start_plan(
+            brief, target_s=loaded.target_s, model=loaded.profile_id, resolution=loaded.resolution,
+            aspect_ratio=loaded.aspect_ratio, fps=loaded.fps, audio=loaded.audio, style=style, privacy=privacy, seed=seed,
+            max_price_usd=max_price_usd, revision=(loaded, instruction, numbers),
+        )
+        return job.wait(timeout=timeout, on_progress=on_progress) if wait else job
+
+    def _start_plan(
+        self,
+        brief: str,
+        *,
+        target_s: float,
+        model: str | None,
+        resolution: str | None,
+        aspect_ratio: str | None,
+        fps: int | None,
+        audio: bool,
+        style: str | None,
+        privacy: Privacy,
+        seed: int | None,
+        max_price_usd: float | None,
+        revision: tuple[Plan, str, list[int] | None] | None = None,
+        before_submit: Callable[[PlanJob], None] | None = None,
+    ) -> PlanJob:
+        """Routes, checks, prices and submits a plan job; the shared half of `plan` and `revise_plan`. Everything that can
+        be refused here is refused before anything is sealed, sent or charged. `before_submit` gets a Private job's handle
+        (with its output key) just before it is sent, so a caller can keep the key even if the answer is lost."""
+        if privacy not in ("private", "standard"):
+            raise KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".')
+        _check_budget(max_price_usd)
+        if not isinstance(brief, str) or (revision is None and not brief.strip()):
+            raise KunoError(0, "brief_required", ERROR_CODES["brief_required"])
+        if style is not None and not isinstance(style, str):
+            raise KunoError(0, "invalid_params", "style is text, such as \"35mm film, warm\".")
+        standard = privacy == "standard"
+
+        route = self.route(Mode.PLAN, model, privacy=privacy, resolution=resolution, aspect_ratio=aspect_ratio, fps=fps)
+        profile = self.profile(route.profile_id)
+        limits = profile.limits.plan
+        if Mode.PLAN not in profile.modes or limits is None or profile.limits.storyboard is None:
+            raise KunoError(0, "invalid_params", f"{profile.name} doesn't write plans.")
+        params = _plan_params(profile, target_s, resolution, aspect_ratio, fps, audio, route.fallback_reason)
+        try:
+            validate_params(profile, params)
+        except (ParamError, ValidationError) as exc:
+            raise KunoError(0, "invalid_params", str(exc)) from None
+        if len(brief) > limits.max_brief_chars:
+            raise KunoError(0, "prompt_too_long", f"A brief is limited to {limits.max_brief_chars:,} characters on {profile.name}.")
+        if style and len(style) > limits.max_style_chars:
+            raise KunoError(0, "prompt_too_long", f"A style is limited to {limits.max_style_chars:,} characters on {profile.name}.")
+
+        # Only workers that advertise plan/1 can open a plan job: an older one would leave it to time out.
+        capable = [enclave for enclave in route.enclaves if PLAN_FEATURE in (enclave.get("features") or ())]
+        fitting = [enclave for enclave in capable if envelope_fits((enclave.get("envelope") or {}).get(profile.id), params)]
+        if not standard and not fitting:
+            if route.enclaves and not any("features" in enclave for enclave in route.enclaves):
+                message = ("This gateway doesn't say which workers write plans (no features in /v1/route), so the brief wasn't "
+                           "sent: a worker that can't write plans would leave the job to time out. Nothing was charged.")
+            else:
+                message = f"No confidential worker that writes plans for {profile.name} at this size is online right now. Nothing was sent or charged."
+            raise KunoError(503, "plans_unavailable", message)
+        max_shot_s = _longest_served_shot(profile, params, fitting)
+
+        revise = None
+        if revision is not None:
+            earlier, instruction, numbers = revision
+            try:
+                revise = PlanRevision(plan=_restitched(profile, earlier), instruction=instruction or "", shots=numbers)
+            except ValidationError as exc:
+                raise KunoError(0, "invalid_plan", f"The revision can't be made: {exc.errors()[0].get('msg', exc)}.") from None
+        options = PlanOptions(style=style or None, max_shot_s=max_shot_s, revise=revise)
+        try:
+            context = plan_context(profile, params, options)
+        except PlanError as exc:
+            raise KunoError(503, "no_capacity", f"No worker can plan shots for this size and frame rate: {exc}.") from None
+        if revise is not None:
+            try:
+                protocol_plans.check_revision(revise, context)
+            except PlanError as exc:
+                raise KunoError(0, "invalid_plan", f"The plan to revise can't be sent: {exc}.") from None
+        plan_options = options.model_dump(mode="json", exclude_none=True)
+        priced = self._within_budget(params, privacy, max_price_usd)
+
+        if standard:
+            body: dict[str, Any] = {"job_id": str(uuid.uuid4()), "params": params.model_dump(mode="json"), "brief": brief}
+            if style:
+                body["style"] = style
+            body["options"] = {key: value for key, value in plan_options.items() if key != "style"}
+            if seed is not None:
+                body["seed"] = seed
+            status = JobStatus.model_validate(self._request("POST", "/v1/standard/plans", json=body).json())
+            return PlanJob(
+                self, status.job_id, status.params.profile_id, "standard", max_shot_s=max_shot_s,
+                fallback_reason=route.fallback_reason, quote=priced,
+            )
+
+        narrowed = route.model_copy(update={"enclaves": fitting})
+        enclave = self._pick_enclave(narrowed)
+        job_id = str(uuid.uuid4())
+        session = SenderSession(b64d(enclave["hpke_public_key"]))
+        payload = SealedPayload(prompt=brief, seed=seed, options={PLAN_OPTION: plan_options})
+        try:
+            ciphertext = seal_payload(session, payload, job_aad(job_id, enclave["enclave_id"], params, []))
+        except PayloadTooLarge as exc:
+            raise KunoError(0, "request_too_large", f"The request is too large to seal: {exc}.") from None
+        request = JobCreate(job_id=job_id, params=params, enclave_id=enclave["enclave_id"], enc=b64e(session.enc), ciphertext=b64e(ciphertext))
+        job = PlanJob(
+            self, job_id, profile.id, "private", output_key=session.output_key, signing_public_key=b64d(enclave["signing_public_key"]),
+            max_shot_s=max_shot_s, fallback_reason=route.fallback_reason, quote=priced,
+        )
+        if before_submit is not None:
+            before_submit(job)
+        self._request("POST", "/v1/videos", json=request.model_dump(mode="json"))
+        return job
+
     def estimate_price(
         self,
-        model: str,
+        model: str | None = None,
         *,
         duration_s: float | None = None,
         shots: Iterable[Shot] | None = None,
@@ -739,17 +998,30 @@ class KunoClient:
         aspect_ratio: str | None = None,
         fps: int | None = None,
         privacy: Privacy = "private",
+        mode: Mode | str | None = None,
+        plan: protocol_plans.Plan | None = None,
     ) -> float:
         """What a job on `model` would cost in USD, from the price the gateway publishes (`/v1/models`), for the params
         `generate` would send given the same settings and no fallback: `profile.price_usd(params, privacy)`. A storyboard
-        (`shots`) costs its stitched seconds. The gateway's charge when the job is accepted is what counts, and every
-        price is a placeholder for now."""
+        (`shots`) costs its stitched seconds; rendering a `plan` costs its storyboard's. `mode="plan"` is a plan job's
+        flat price, whatever `duration_s` it targets. The gateway's charge when the job is accepted is what counts, and
+        every price is a placeholder for now."""
         if privacy not in ("private", "standard"):
             raise KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".')
-        shots = _check_storyboard(shots, [], None, duration_s)
-        mode = Mode.TEXT_TO_VIDEO if shots is None else Mode.STORYBOARD
+        if plan is not None:
+            _, shots, model, resolution, aspect_ratio, fps, _ = _plan_request(plan, None, shots, duration_s, mode, model, resolution, aspect_ratio, fps)
+            mode = None
+        if model is None:
+            raise KunoError(0, "invalid_params", "Name the model to price, or pass plan=.")
         profile = self.profile(model)
-        params = _fit_params(profile, mode, [], duration_s, resolution, aspect_ratio, fps, True, None, shots=shots)
+        if mode is not None and Mode(mode) is Mode.PLAN:
+            if shots is not None:
+                raise KunoError(0, "invalid_shots", "A plan job takes no shots: it writes them.")
+            params = _plan_params(profile, 30.0 if duration_s is None else duration_s, resolution, aspect_ratio, fps, True, None)
+        else:
+            shots = _check_storyboard(shots, [], None, duration_s)
+            chosen = Mode.TEXT_TO_VIDEO if shots is None else Mode.STORYBOARD
+            params = _fit_params(profile, chosen, [], duration_s, resolution, aspect_ratio, fps, True, None, shots=shots)
         try:
             return profile.price_usd(params, privacy)
         except PrivacyModeUnavailable as exc:
@@ -771,15 +1043,23 @@ class KunoClient:
         audio: bool = True,
         input_roles: Iterable[InputRole | str] | None = None,
         privacy: Privacy = "private",
+        plan: protocol_plans.Plan | None = None,
     ) -> Quote:
         """The gateway's exact price for a job shaped like this (`POST /v1/quote`): what it would hold if the job were
         submitted now, after routing (fallbacks, regions, capacity) and the defaults `generate` fills in. Takes
         `generate`'s job-shape arguments and no prompt; `input_roles` stands for the inputs (none by default: the mode
         comes from them as `generate` infers it, or pass `mode`). `shots` are `Shot`s, whose prompts are never sent, or
         `ShotSpec`s. Refusals raise the code the job itself would get (`invalid_params`, `privacy_mode_unavailable`,
-        `region_restricted`, `no_capacity`, `private_mode_not_eligible`...)."""
+        `region_restricted`, `no_capacity`, `private_mode_not_eligible`...).
+
+        `mode="plan"` with `duration_s` (the target) quotes a plan job: a flat price, whatever the target. `plan=` quotes
+        rendering that plan as its storyboard (only its shots' lengths and joins are sent)."""
         if privacy not in ("private", "standard"):
             raise KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".')
+        if plan is not None:
+            _, shots, model, resolution, aspect_ratio, fps, audio = _plan_request(
+                plan, None, shots, duration_s, mode, model, resolution, aspect_ratio, fps
+            )
         roles = [InputRole(role) for role in input_roles] if input_roles is not None else None
         shot_list = _check_storyboard(shots, [], mode, duration_s, require_prompts=False)
         if shot_list is not None and roles:
@@ -977,6 +1257,139 @@ class StandardVideoJob:
     def delete(self) -> None:
         """Deletes the stored video, prompt, inputs and preview. The billing record stays."""
         self.client.delete(self.job_id)
+
+
+class PlanJob:
+    """A plan job (`client.plan(..., wait=False)`): wait for it, then open and check the plan. A Private plan job holds
+    its output key, the only key that opens the plan, so treat its `export()` as a secret. A Standard one holds none: the
+    account reads the plan from the gateway.
+
+    `max_shot_s` is the longest shot the plan was asked for (from the routable workers' envelopes), which the delivered
+    plan is checked against with everything else `kuno_protocol.plans.validate` checks."""
+
+    def __init__(
+        self,
+        client: KunoClient,
+        job_id: str,
+        profile_id: str,
+        privacy: Privacy = "private",
+        *,
+        output_key: bytes | None = None,
+        signing_public_key: bytes | None = None,
+        max_shot_s: float | None = None,
+        fallback_reason: str | None = None,
+        quote: Quote | None = None,
+    ):
+        if privacy == "private" and (output_key is None or signing_public_key is None):
+            raise ValueError("a private plan job needs its output key and the enclave's signing key")
+        self.client = client
+        self.job_id = job_id
+        self.profile_id = profile_id
+        self.privacy: Privacy = privacy
+        self.output_key = output_key
+        self.signing_public_key = signing_public_key
+        self.max_shot_s = max_shot_s
+        self.fallback_reason = fallback_reason
+        self.quote = quote
+
+    def export(self) -> dict[str, Any]:
+        """Everything needed to fetch and open the plan later. For a Private job it holds the output key: a secret."""
+        data: dict[str, Any] = {
+            "kind": "plan",
+            "privacy": self.privacy,
+            "job_id": self.job_id,
+            "profile_id": self.profile_id,
+            "max_shot_s": self.max_shot_s,
+            "fallback_reason": self.fallback_reason,
+        }
+        if self.privacy == "private":
+            data["output_key"] = b64e(self.output_key or b"")
+            data["signing_public_key"] = b64e(self.signing_public_key or b"")
+        return data
+
+    @classmethod
+    def restore(cls, client: KunoClient, data: Mapping[str, Any]) -> PlanJob:
+        privacy = "standard" if data.get("privacy") == "standard" else "private"
+        return cls(
+            client, data["job_id"], data.get("profile_id") or "", privacy,
+            output_key=b64d(data["output_key"]) if privacy == "private" else None,
+            signing_public_key=b64d(data["signing_public_key"]) if privacy == "private" else None,
+            max_shot_s=data.get("max_shot_s"), fallback_reason=data.get("fallback_reason"),
+        )
+
+    def status(self) -> JobStatus:
+        return self.client.status(self.job_id)
+
+    def cancel(self) -> JobStatus:
+        return self.client.cancel(self.job_id)
+
+    def delete(self) -> None:
+        self.client.delete(self.job_id)
+
+    def wait(self, timeout: float = 600.0, poll_s: float = 1.0, on_progress: ProgressFn | None = None) -> Plan:
+        """Waits for the plan (stages `planning`, then `checking`), then opens and checks it. A job that fails raises its
+        code: `plan_failed` (the planner wrote nothing usable) and `safety_blocked` are refunded."""
+        return _wait(self, timeout, poll_s, on_progress)
+
+    def result(self, status: JobStatus | None = None) -> Plan:
+        """The finished plan. Private: the sealed output is checked against the enclave-signed receipt, decrypted here,
+        unpadded (form 2 framing only) and checked against the receipt's `content_digest`. Standard: the plan the gateway
+        stored, checked against the same digest. Either way it must pass `kuno_protocol.plans.validate` for its job."""
+        status = status or self.status()
+        receipt = status.receipt
+        if status.status is not JobState.SUCCEEDED or receipt is None:
+            raise KunoError(0, "not_ready", f"Job {self.job_id} is {status.status.value}.")
+        if status.params.mode is not Mode.PLAN or receipt.body.plan is None:
+            raise KunoError(0, "integrity", "This job's receipt doesn't describe a plan.")
+        if receipt.body.job_id != self.job_id:
+            raise KunoError(0, "integrity", "The receipt is for another job.")
+        if self.privacy == "private":
+            if status.output_blob_id is None:
+                raise KunoError(0, "not_ready", f"Job {self.job_id} has no output yet.")
+            sealed = self.client._request("GET", f"/v1/blobs/{status.output_blob_id}").content
+            if sha256_hex(sealed) != receipt.body.output_digest:
+                raise KunoError(0, "integrity", "The downloaded plan does not match the enclave's receipt.")
+            if not verify_receipt(receipt, self.signing_public_key or b""):
+                raise KunoError(0, "integrity", "The receipt was not signed by the attested enclave for this job.")
+            try:
+                _, data = open_plan(self.output_key or b"", self.job_id, sealed)
+            except DecryptionError:
+                raise KunoError(0, "decrypt_failed", "The plan didn't open with this job's output key.") from None
+            except PlanError as exc:
+                raise KunoError(0, "integrity", f"The enclave's output isn't a sealed plan: {exc}.") from None
+        else:
+            # The stored plan's bytes: exactly the JSON the receipt's content_digest covers.
+            data = self.client._request("GET", f"/v1/standard/plans/{quote(self.job_id, safe='')}").content
+            try:
+                document = json.loads(data)
+            except ValueError:
+                raise KunoError(0, "integrity", "The gateway's stored plan isn't JSON.") from None
+            if isinstance(document, dict) and isinstance(document.get("plan"), dict) and "shots" not in document:
+                # A gateway that wraps the plan in the job's details: the plan's canonical JSON is what was digested.
+                try:
+                    data = encode_plan(protocol_plans.Plan.model_validate(document["plan"]))
+                except (ValidationError, ValueError):
+                    raise KunoError(0, "integrity", "The gateway's stored plan isn't a Plan v1.") from None
+        if sha256_hex(data) != receipt.body.content_digest:
+            raise KunoError(0, "integrity", "The plan does not match the receipt's content digest.")
+        try:
+            plan = Plan.model_validate_json(data)
+        except ValidationError:
+            raise KunoError(0, "integrity", "The plan isn't a Plan v1.") from None
+        self._check(plan, status)
+        plan._job_id, plan._receipt, plan._privacy = self.job_id, receipt, self.privacy
+        return plan
+
+    def _check(self, plan: Plan, status: JobStatus) -> None:
+        info = status.receipt.body.plan if status.receipt else None
+        profile = self.client.profile(status.params.profile_id)
+        try:
+            context = plan_context(profile, status.params, PlanOptions(max_shot_s=self.max_shot_s))
+            protocol_plans.validate(plan, profile, context=context)
+        except PlanError as exc:
+            raise KunoError(0, "integrity", f"The delivered plan breaks the plan rules: {exc}.") from None
+        if info is None or info.shots != len(plan.shots) or abs(info.duration_s - plan.duration_s) > 1e-6:
+            raise KunoError(0, "integrity", "The plan doesn't match the shots and length its receipt describes.")
 
 
 # A share token and an output key are both 32 bytes written as base64url: 43 characters.
@@ -1242,3 +1655,77 @@ def _route_duration(duration_s: float | None, shots: list[Shot] | None) -> float
     if shots is None:
         return duration_s
     return max((shot.duration_s for shot in shots if shot.duration_s is not None), default=None)
+
+
+def _plan_params(
+    profile: ModelProfile,
+    target_s: float,
+    resolution: str | None,
+    aspect_ratio: str | None,
+    fps: int | None,
+    audio: bool,
+    fallback_reason: str | None,
+) -> GenerationParams:
+    """A plan job's public params: the storyboard-to-be's frame, filled in as `generate` fills it in, and its target
+    length as `duration_s`. No shots and no inputs."""
+    if isinstance(target_s, bool) or not isinstance(target_s, (int, float)) or not math.isfinite(target_s):
+        raise KunoError(0, "invalid_params", "target_s is the plan's length in seconds.")
+    frame = _fit_params(profile, Mode.PLAN, [], None, resolution, aspect_ratio, fps, audio, fallback_reason)
+    return frame.model_copy(update={"duration_s": float(target_s)})
+
+
+def _longest_served_shot(profile: ModelProfile, params: GenerationParams, enclaves: list[dict]) -> float | None:
+    """The longest shot a plan may ask for: the longest any of these workers' serving envelopes renders at the plan's size
+    and frame rate (a worker without an envelope renders the profile's limits), capped by the profile. The storyboard is
+    routed by the same rule. None when no worker is listed."""
+    cap = profile_max_duration(profile, params.fps)
+    served = []
+    for enclave in enclaves:
+        table = (enclave.get("envelope") or {}).get(profile.id)
+        longest = cap if table is None else envelope_max_duration(table, params.resolution, params.aspect_ratio, params.fps)
+        if longest is not None:
+            served.append(min(longest, cap))
+    return max(served) if served else None
+
+
+def _restitched(profile: ModelProfile, plan: Plan) -> Plan:
+    """The plan with `duration_s` recomputed from its shots, so shot lengths edited by hand keep the rule that it is their
+    stitched length. A plan whose shots can't be measured is left as it is, for `validate` to name the problem."""
+    try:
+        stitched = storyboard_duration_s(profile, plan.shot_specs(), plan.fps)
+    except (ParamError, ValidationError, ValueError):
+        return plan
+    if abs(stitched - plan.duration_s) <= 1e-9:
+        return plan
+    copy = plan.model_copy(update={"duration_s": stitched})
+    copy._privacy = plan.privacy
+    return copy
+
+
+def _plan_request(
+    plan: protocol_plans.Plan,
+    prompt: str | None,
+    shots: Iterable[Shot | ShotSpec] | None,
+    duration_s: float | None,
+    mode: Mode | str | None,
+    model: str | None,
+    resolution: str | None,
+    aspect_ratio: str | None,
+    fps: int | None,
+) -> tuple[str, list[Shot], str, str, str, int, bool]:
+    """A plan as the storyboard request it renders as: (scene, shots, model, resolution, aspect ratio, fps, audio). A plan
+    brings its own scene, shots and length, and a frame given next to it must be the plan's."""
+    if not isinstance(plan, protocol_plans.Plan):
+        raise KunoError(0, "invalid_plan", "plan= takes a Plan, as plan() or revise_plan() return it (Plan.model_validate reads JSON).")
+    if prompt is not None or shots is not None or duration_s is not None:
+        raise KunoError(0, "invalid_params", "A plan brings its own scene, shots and length: pass no prompt, shots or duration_s with it.")
+    if mode is not None and Mode(mode) is not Mode.STORYBOARD:
+        raise KunoError(0, "invalid_params", f"A plan renders as a storyboard, not {Mode(mode).value}.")
+    for name, given, own in (
+        ("model", model, plan.profile_id), ("resolution", resolution, plan.resolution),
+        ("aspect_ratio", aspect_ratio, plan.aspect_ratio), ("fps", fps, plan.fps),
+    ):
+        if given is not None and given != own:
+            raise KunoError(0, "invalid_params", f"The plan was written for {name} {own}, not {given}.")
+    planned = [Shot(prompt=shot.prompt, duration_s=shot.duration_s, join=shot.join) for shot in plan.shots]
+    return plan.scene, planned, plan.profile_id, plan.resolution, plan.aspect_ratio, plan.fps, plan.audio

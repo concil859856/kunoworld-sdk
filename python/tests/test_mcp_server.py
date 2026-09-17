@@ -21,7 +21,7 @@ from kuno_fake_network import API_URL, PROFILES, FakeNetwork  # noqa: E402
 from kunoworld.mcp.server import PRIVACY_NOTE, build_server  # noqa: E402
 from kunoworld.mcp.tools import Config, KunoTools  # noqa: E402
 
-TOOLS = {"list_models", "quote_price", "generate_video", "get_job", "download_video", "cancel_job", "list_jobs"}
+TOOLS = {"list_models", "quote_price", "generate_video", "plan_video", "revise_plan", "get_job", "download_video", "cancel_job", "list_jobs"}
 FAST = PROFILES["ltx-2.5-fast"]
 
 
@@ -42,14 +42,21 @@ def test_the_tools_an_agent_sees(tmp_path):
             listed = {tool.name: tool for tool in (await session.list_tools()).tools}
             assert set(listed) == TOOLS
             generate = listed["generate_video"]
-            assert generate.inputSchema["required"] == ["prompt"]
-            assert {"max_price_usd", "shots", "privacy", "first_frame_path", "wait", "seed"} <= set(generate.inputSchema["properties"])
+            # A prompt, or a plan to render instead.
+            assert "required" not in generate.inputSchema and "prompt" in generate.inputSchema["properties"]
+            assert {"max_price_usd", "shots", "privacy", "first_frame_path", "wait", "seed", "plan_id"} <= set(generate.inputSchema["properties"])
             assert generate.inputSchema["$defs"]["ShotInput"]["properties"]["join"]["anyOf"][0]["enum"] == ["fresh", "continue", "cut"]
             # What the assistant's host can see is said where the agent reads it.
             assert PRIVACY_NOTE in generate.description and "whoever provides the assistant" in generate.description
             assert listed["quote_price"].annotations.readOnlyHint is True and generate.annotations.readOnlyHint is False
             assert set(listed["quote_price"].inputSchema["properties"]) == set(generate.inputSchema["properties"]) - {
-                "prompt", "max_price_usd", "seed", "wait", "timeout_s"}
+                "prompt", "max_price_usd", "seed", "wait", "timeout_s", "plan_id"}
+            plan = listed["plan_video"]
+            assert plan.inputSchema["required"] == ["brief"] and PRIVACY_NOTE in plan.description and "first draft" in plan.description
+            assert {"target_s", "style", "privacy", "max_price_usd", "model", "aspect_ratio"} <= set(plan.inputSchema["properties"])
+            revise = listed["revise_plan"]
+            assert {"plan_id", "plan", "instruction", "shots", "max_price_usd"} <= set(revise.inputSchema["properties"])
+            assert not plan.annotations.readOnlyHint and PRIVACY_NOTE in revise.description
 
     anyio.run(main)
 
@@ -95,6 +102,26 @@ def test_waiting_sends_progress_notifications(tmp_path):
     anyio.run(main)
     assert [message for _, _, message in progress] == ["running: shot 1/2", "running: shot 2/2", "succeeded: done"]
     assert progress[-1][:2] == (1.0, 1.0)
+
+
+def test_a_plan_through_mcp_reports_progress_and_renders_by_its_id(tmp_path):
+    network = FakeNetwork()
+    progress: list[str | None] = []
+
+    async def record(value: float, total: float | None, message: str | None) -> None:
+        progress.append(message)
+
+    async def main():
+        async with create_connected_server_and_client_session(served(tmp_path, network)) as session:
+            brief = {"brief": "A 20-second film about a lighthouse keeper's last night.", "target_s": 20, "max_price_usd": 1}
+            planned = payload(await session.call_tool("plan_video", brief, progress_callback=record))
+            assert planned["status"] == "succeeded" and planned["plan"]["plan_id"] == planned["plan_id"]
+            assert abs(planned["plan"]["stitched_s"] - 20) <= 0.5 and planned["render_price"]["price_usd"] > 0
+            rendered = payload(await session.call_tool("generate_video", {"plan_id": planned["plan_id"], "max_price_usd": 5}))
+            assert (rendered["mode"], rendered["shots"], rendered["duration_s"]) == ("storyboard", len(planned["plan"]["shots"]), planned["plan"]["stitched_s"])
+
+    anyio.run(main)
+    assert progress == ["running: planning", "running: checking", "succeeded: done"]
 
 
 def test_the_stdio_server_starts_and_lists_its_tools(tmp_path):

@@ -1,5 +1,5 @@
 import { verifyEvidence, verifySignature, verifySignedManifest } from "./attestation.js";
-import { decryptBlob, encryptBlob, openSenderSession, padPayload, sha256Hex } from "./crypto.js";
+import { decryptBlob, DecryptionError, encryptBlob, openSenderSession, padPayload, sha256Hex } from "./crypto.js";
 import {
   addElementLines,
   checkElementUse,
@@ -16,6 +16,20 @@ import {
 } from "./elements.js";
 import { b64d, b64e, canonicalJson, concatBytes, utf8 } from "./encoding.js";
 import { ERROR_CODES, KunoError } from "./errors.js";
+import {
+  encodePlan,
+  openPlan,
+  parsePlan,
+  PLAN_FEATURE,
+  PLAN_OPTION,
+  planContext,
+  planPriceUsd,
+  restitchPlan,
+  validatePlan,
+  type Plan,
+  type PlanOptions,
+  type PlanRevision,
+} from "./plans.js";
 import type {
   EnclaveInfo,
   Eligibility,
@@ -139,6 +153,63 @@ export interface GenerationResult {
   privacy: PrivacyMode;
 }
 
+/** A plan from a brief (PROTOCOL.md "Plans (Director)"): a storyboard's scene and shots, written inside the enclave. */
+export interface PlanRequest {
+  /** What the video is for, what happens and how it should feel. Words to be spoken or a slogan go in quotes. */
+  brief: string;
+  /** The stitched length to aim for, in seconds: from the profile's `limits.plan.min_target_s` to `storyboard.max_total_s`. */
+  targetS: number;
+  /** Default `ltx-2.5-fast`, the profile plans are written for. */
+  model?: string;
+  resolution?: string;
+  aspectRatio?: string;
+  fps?: number;
+  audio?: boolean;
+  /** A look to keep to, e.g. "35mm film, warm". */
+  style?: string;
+  /** `private` (default): sealed here to an attested enclave that writes plans. `standard`: readable by KunoWorld. */
+  privacy?: PrivacyMode;
+  seed?: number;
+}
+
+/** A revision of a plan: a new plan job with the same frame and target. */
+export interface PlanRevisionOptions {
+  /** Only rewrite these shots, numbered from 1; the title, scene, notes and other shots come back unchanged. */
+  shots?: number[];
+  /** The original brief, so the planner can keep its quoted words; may be left out. */
+  brief?: string;
+  style?: string;
+  /** Default: the privacy the plan was made in, else `private`. */
+  privacy?: PrivacyMode;
+  seed?: number;
+}
+
+/** A plan job in flight. A Private one holds its output key, the only key that opens the plan: store it like a password. */
+export interface PlanHandle {
+  kind: "plan";
+  jobId: string;
+  privacy: PrivacyMode;
+  profileId: string;
+  enclaveId: string;
+  /** Private only. */
+  outputKey?: string;
+  signingPublicKey?: string;
+  /** The longest shot the plan was asked for, from the routable plan workers' envelopes; the plan is checked against it. */
+  maxShotS: number | null;
+  fallbackReason: string | null;
+  createdAt: number;
+}
+
+/** A finished plan, opened and checked against its receipt and the plan rules. */
+export interface PlanResult {
+  jobId: string;
+  plan: Plan;
+  /** The plan's JSON as delivered; its SHA-256 is `receipt.body.content_digest`. */
+  json: Uint8Array;
+  receipt: Receipt;
+  privacy: PrivacyMode;
+}
+
 export type SubmitStage = "routing" | "verifying" | "encrypting" | "uploading" | "submitting";
 
 export interface WaitOptions {
@@ -218,14 +289,19 @@ export function privacyModes(profile: ModelProfile): PrivacyMode[] {
   return profile.pricing.standard_usd_per_second ? ["private", "standard"] : ["private"];
 }
 
-/** The params a price depends on. `shots` only for a storyboard, whose longest shot decides the long-clip rule. */
-export type PricedParams = Pick<GenerationParams, "resolution" | "duration_s" | "fps"> & Partial<Pick<GenerationParams, "shots">>;
+/**
+ * The params a price depends on. `shots` only for a storyboard, whose longest shot decides the long-clip rule; `mode`
+ * `plan` for a plan job's flat price.
+ */
+export type PricedParams = Pick<GenerationParams, "resolution" | "duration_s" | "fps"> & Partial<Pick<GenerationParams, "shots" | "mode">>;
 
 /**
  * The gateway's price for a job (kuno_protocol `ModelProfile.price_usd`): the per-second rate for the privacy
  * mode x duration x the fps multiplier (and, in Private mode, the long-clip multiplier), never below the profile's
  * minimum charge. A storyboard pays for its stitched `duration_s`; the long-clip rule looks at its longest shot.
- * Null where the profile has no such price: a resolution it doesn't render, or Standard on a Private-only profile.
+ * A plan (`mode: "plan"`) costs the flat `plan_usd` or `standard_plan_usd`, whatever its target length.
+ * Null where the profile has no such price: a resolution it doesn't render, Standard on a Private-only profile, or plans on
+ * a profile that doesn't write them.
  */
 export function priceQuote(
   profile: ModelProfile,
@@ -234,6 +310,10 @@ export function priceQuote(
 ): PriceQuote | null {
   const pricing = profile.pricing;
   if (!privacyModes(profile).includes(privacy)) return null;
+  if (params.mode === "plan") {
+    const flat = planPriceUsd(profile, privacy);
+    return flat === null ? null : { usd: flat, usdPerSecond: 0, multiplier: 1, minimumApplied: false };
+  }
   const rate = (privacy === "private" ? pricing.usd_per_second : pricing.standard_usd_per_second)?.[params.resolution];
   if (rate === undefined) return null;
   let multiplier = pricing.fps_multipliers?.[String(params.fps)] ?? 1;
@@ -261,7 +341,7 @@ export function priceUsd(
  */
 export function envelopeFits(
   envelope: ServingEnvelope | null | undefined,
-  params: Pick<GenerationParams, "profile_id" | "resolution" | "aspect_ratio" | "fps" | "duration_s"> & Partial<Pick<GenerationParams, "shots">>,
+  params: Pick<GenerationParams, "profile_id" | "resolution" | "aspect_ratio" | "fps" | "duration_s"> & Partial<Pick<GenerationParams, "shots" | "mode">>,
 ): boolean {
   const table = envelope?.[params.profile_id];
   if (!table) return true;
@@ -326,8 +406,12 @@ export function shotPrompt(scene: string, prompt: string): string {
   return s ? `${s}\n\n${prompt.trim()}` : prompt.trim();
 }
 
-/** The longest single model call a job needs: its duration, or a storyboard's longest shot. Envelopes and the long-clip price use it. */
-export function renderDurationS(params: Pick<GenerationParams, "duration_s"> & Partial<Pick<GenerationParams, "shots">>): number {
+/**
+ * The longest single model call a job needs: its duration, or a storyboard's longest shot. Envelopes and the long-clip
+ * price use it. A plan renders nothing, so 0: any worker that serves its size and frame rate at all fits it.
+ */
+export function renderDurationS(params: Pick<GenerationParams, "duration_s"> & Partial<Pick<GenerationParams, "shots" | "mode">>): number {
+  if (params.mode === "plan") return 0;
   return params.shots?.length ? Math.max(...params.shots.map((shot) => shot.duration_s)) : params.duration_s;
 }
 
@@ -465,6 +549,9 @@ export function fitParams(
     );
     params.shots = shots;
     params.duration_s = storyboardDurationS(profile, shots, fps);
+  } else if (mode === "plan") {
+    // A plan's duration is the stitched length it aims for, not a clip's: never fitted to the clip limits.
+    params.duration_s = req.durationS ?? 30;
   }
   return params;
 }
@@ -478,6 +565,65 @@ export function jobAad(jobId: string, enclaveId: string, params: GenerationParam
 export function verifyReceipt(receipt: Receipt, signingPublicKey: Uint8Array): boolean {
   const message = concatBytes(utf8("kuno/v1/receipt\n"), canonicalJson(receipt.body));
   return verifySignature(b64d(receipt.signature), message, signingPublicKey);
+}
+
+/**
+ * The longest shot a plan may ask for: the longest any of these workers' envelopes renders at the plan's size and frame
+ * rate (a worker without one renders the profile's limits), capped by the profile. The storyboard routes by the same rule.
+ */
+function longestServedShot(profile: ModelProfile, params: GenerationParams, enclaves: EnclaveInfo[]): number | null {
+  const lim = profile.limits;
+  const cap = Math.min(lim.max_duration_s, lim.max_duration_s_by_fps?.[String(params.fps)] ?? lim.max_duration_s);
+  const served = enclaves
+    .map((e) => {
+      const table = e.envelope?.[profile.id];
+      const longest = table ? table[params.resolution]?.[params.aspect_ratio]?.[String(params.fps)] : cap;
+      return typeof longest === "number" ? Math.min(longest, cap) : null;
+    })
+    .filter((x): x is number => x !== null);
+  return served.length ? Math.max(...served) : null;
+}
+
+/** A plan with exactly Plan v1's fields: the enclave refuses unknown ones, and an app's own (card ids) stay behind. */
+function cleanPlan(plan: Plan): Plan {
+  return {
+    v: 1,
+    profile_id: plan.profile_id,
+    resolution: plan.resolution,
+    aspect_ratio: plan.aspect_ratio,
+    fps: plan.fps,
+    audio: plan.audio,
+    target_s: plan.target_s,
+    duration_s: plan.duration_s,
+    title: plan.title ?? "",
+    scene: plan.scene ?? "",
+    shots: (plan.shots ?? []).map((shot) => ({ beat: shot.beat ?? "", prompt: shot.prompt, duration_s: shot.duration_s, join: shot.join })),
+    notes: plan.notes ?? "",
+    repairs: [...(plan.repairs ?? [])],
+    planner: { model: plan.planner?.model ?? "unknown", prompt_version: plan.planner?.prompt_version ?? "plan/1" },
+  };
+}
+
+/** `check_revision`: the plan to revise has this job's frame, keeps the rules, and has the shots named. Throws `invalid_plan`. */
+function checkRevision(revise: PlanRevision, context: ReturnType<typeof planContext>): void {
+  const plan = revise.plan;
+  if (
+    plan.profile_id !== context.profile.id ||
+    plan.resolution !== context.resolution ||
+    plan.aspect_ratio !== context.aspectRatio ||
+    plan.fps !== context.fps ||
+    plan.audio !== context.audio
+  ) {
+    throw new KunoError(0, "invalid_plan", "The plan to revise has a different profile, size, frame rate or sound than this job.");
+  }
+  validatePlan(plan, context.profile);
+  if (!revise.shots) return;
+  if (revise.shots[revise.shots.length - 1] > plan.shots.length) throw new KunoError(0, "invalid_plan", `The plan to revise has ${plan.shots.length} shots.`);
+  plan.shots.forEach((shot, i) => {
+    if (!revise.shots!.includes(i + 1) && shot.duration_s > context.maxShotS + 1e-6) {
+      throw new KunoError(0, "invalid_plan", `Shot ${i + 1}, which stays as it is, is longer than this plan's longest shot, ${context.maxShotS} s.`);
+    }
+  });
 }
 
 async function toBytes(file: Blob | Uint8Array): Promise<Uint8Array> {
@@ -986,16 +1132,20 @@ export class KunoClient {
   }
 
   async wait(handle: AnyJobHandle, opts: WaitOptions = {}): Promise<GenerationResult> {
-    const deadline = Date.now() + (opts.timeoutMs ?? 30 * 60 * 1000);
+    return this.poll(handle.jobId, opts, 30 * 60 * 1000, "video", (status) => this.result(handle, status));
+  }
+
+  private async poll<T>(jobId: string, opts: WaitOptions, timeoutMs: number, what: string, done: (status: JobStatus) => Promise<T>): Promise<T> {
+    const deadline = Date.now() + (opts.timeoutMs ?? timeoutMs);
     for (;;) {
-      if (opts.signal?.aborted) throw new KunoError(0, "aborted", "Stopped waiting for the video.");
-      const status = await this.status(handle.jobId);
+      if (opts.signal?.aborted) throw new KunoError(0, "aborted", `Stopped waiting for the ${what}.`);
+      const status = await this.status(jobId);
       opts.onProgress?.(status);
-      if (status.status === "succeeded") return this.result(handle, status);
+      if (status.status === "succeeded") return done(status);
       if (status.status === "failed" || status.status === "canceled") {
         throw new KunoError(0, status.error_code ?? `job_${status.status}`, status.error ?? "The job did not complete.");
       }
-      if (Date.now() > deadline) throw new KunoError(0, "timeout", `Job ${handle.jobId} is still ${status.status}.`);
+      if (Date.now() > deadline) throw new KunoError(0, "timeout", `Job ${jobId} is still ${status.status}.`);
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, opts.pollMs ?? 1000);
         opts.signal?.addEventListener("abort", () => {
@@ -1043,6 +1193,233 @@ export class KunoClient {
       throw new KunoError(0, "integrity", "The decrypted video does not match the receipt.");
     }
     return { jobId: handle.jobId, video, receipt, profileId: handle.profileId, fallbackReason: handle.fallbackReason, privacy: "private" };
+  }
+
+  // ------------------------------------------------------------ plans (Director)
+
+  /**
+   * Plans a storyboard from a brief and waits for it: a scene and 2-12 shots fitted to `targetS`, written inside a
+   * confidential worker. Nothing renders; edit the plan, then render it with
+   * `generate({ prompt: plan.scene, shots: planToShots(plan), model: plan.profile_id, ... })`. A plan costs a flat price
+   * (`priceQuote(profile, { mode: "plan", ... })`); `plan_failed` and `safety_blocked` are refunded. A first draft from a
+   * small model: read it before rendering.
+   */
+  async plan(req: PlanRequest, opts: WaitOptions & { onStage?: (stage: SubmitStage) => void } = {}): Promise<PlanResult> {
+    return this.waitPlan(await this.submitPlan(req, opts.onStage), opts);
+  }
+
+  /**
+   * Submits a plan job and returns its handle. Private (default): routes only to attested workers that list `plan/1`,
+   * asks for shots no longer than the longest such a worker renders at this size and frame rate, and seals the brief and
+   * style here. Standard: `POST /v1/standard/plans`, readable by KunoWorld. Refused before anything is sent: an empty or
+   * too long brief (`brief_required`, `prompt_too_long`), a target out of range (`invalid_params`), or no plan worker
+   * (`plans_unavailable`).
+   */
+  async submitPlan(req: PlanRequest, onStage?: (stage: SubmitStage) => void): Promise<PlanHandle> {
+    return this.startPlan(req, null, onStage);
+  }
+
+  /**
+   * Rewrites a plan in the enclave under `instruction` and waits for the new plan. With `shots` (numbered from 1) only
+   * those shots are rewritten. The plan may be edited first: its `duration_s` is recomputed from its shots, and it must
+   * keep the plan rules (`invalid_plan` otherwise, before anything is sent).
+   */
+  async revisePlan(
+    plan: Plan,
+    instruction = "",
+    opts: PlanRevisionOptions & WaitOptions & { onStage?: (stage: SubmitStage) => void } = {},
+  ): Promise<PlanResult> {
+    return this.waitPlan(await this.submitRevision(plan, instruction, opts, opts.onStage), opts);
+  }
+
+  /** Submits a revision (see `revisePlan`) and returns its handle. */
+  async submitRevision(plan: Plan, instruction = "", opts: PlanRevisionOptions = {}, onStage?: (stage: SubmitStage) => void): Promise<PlanHandle> {
+    const req: PlanRequest = {
+      brief: opts.brief ?? "",
+      targetS: plan.target_s,
+      model: plan.profile_id,
+      resolution: plan.resolution,
+      aspectRatio: plan.aspect_ratio,
+      fps: plan.fps,
+      audio: plan.audio,
+      style: opts.style,
+      privacy: opts.privacy,
+      seed: opts.seed,
+    };
+    return this.startPlan(req, { plan, instruction, shots: opts.shots ?? null }, onStage);
+  }
+
+  /** Waits for a plan job, then opens and checks the plan (`planResult`). Default timeout 10 minutes. */
+  async waitPlan(handle: PlanHandle, opts: WaitOptions = {}): Promise<PlanResult> {
+    return this.poll(handle.jobId, opts, 10 * 60 * 1000, "plan", (status) => this.planResult(handle, status));
+  }
+
+  /**
+   * A finished plan. Private: the sealed output is checked against the enclave-signed receipt, decrypted here, unpadded
+   * (form 2 framing only) and checked against the receipt's `content_digest`. Standard: the plan the gateway stored
+   * (`GET /v1/standard/plans/{id}`), checked against the same digest. Either way it must pass `validatePlan` for its job.
+   */
+  async planResult(handle: PlanHandle, status?: JobStatus): Promise<PlanResult> {
+    status ??= await this.status(handle.jobId);
+    const receipt = status.receipt;
+    if (status.status !== "succeeded" || !receipt) throw new KunoError(0, "not_ready", `Job ${handle.jobId} is ${status.status}.`);
+    if (status.params.mode !== "plan" || !receipt.body.plan) throw new KunoError(0, "integrity", "This job's receipt doesn't describe a plan.");
+    if (receipt.body.job_id !== handle.jobId) throw new KunoError(0, "integrity", "The receipt is for another job.");
+    let json: Uint8Array;
+    if (handle.privacy === "standard") {
+      // The stored plan's bytes: exactly the JSON the receipt's content_digest covers.
+      json = new Uint8Array(await (await this.request("GET", `/v1/standard/plans/${encodeURIComponent(handle.jobId)}`)).arrayBuffer());
+      let document: unknown;
+      try {
+        document = JSON.parse(new TextDecoder().decode(json));
+      } catch {
+        throw new KunoError(0, "integrity", "The gateway's stored plan isn't JSON.");
+      }
+      const wrapped = document as { plan?: unknown; shots?: unknown } | null;
+      if (wrapped && typeof wrapped.plan === "object" && wrapped.plan !== null && wrapped.shots === undefined) {
+        // A gateway that wraps the plan in the job's details: the plan's canonical JSON is what was digested.
+        try {
+          json = encodePlan(parsePlan(JSON.stringify(wrapped.plan)));
+        } catch {
+          throw new KunoError(0, "integrity", "The gateway's stored plan isn't a Plan v1.");
+        }
+      }
+    } else {
+      if (!status.output_blob_id || !handle.outputKey || !handle.signingPublicKey) throw new KunoError(0, "not_ready", `Job ${handle.jobId} has no output yet.`);
+      const sealed = new Uint8Array(await (await this.request("GET", `/v1/blobs/${status.output_blob_id}`)).arrayBuffer());
+      if ((await sha256Hex(sealed)) !== receipt.body.output_digest) {
+        throw new KunoError(0, "integrity", "The downloaded plan does not match the enclave's receipt.");
+      }
+      if (!verifyReceipt(receipt, b64d(handle.signingPublicKey))) {
+        throw new KunoError(0, "integrity", "The receipt was not signed by the attested enclave for this job.");
+      }
+      try {
+        json = openPlan(b64d(handle.outputKey), handle.jobId, sealed).json;
+      } catch (err) {
+        if (err instanceof DecryptionError) throw new KunoError(0, "decrypt_failed", "The plan didn't open with this handle's output key.");
+        throw new KunoError(0, "integrity", `The enclave's output isn't a sealed plan: ${(err as Error).message}.`);
+      }
+    }
+    if ((await sha256Hex(json)) !== receipt.body.content_digest) {
+      throw new KunoError(0, "integrity", "The plan does not match the receipt's content digest.");
+    }
+    let plan: Plan;
+    try {
+      plan = parsePlan(json);
+    } catch {
+      throw new KunoError(0, "integrity", "The plan isn't a Plan v1.");
+    }
+    const profile = (await this.models()).models.find((m) => m.id === status.params.profile_id);
+    if (!profile) throw new KunoError(404, "unknown_model", `Unknown model ${status.params.profile_id}.`);
+    try {
+      validatePlan(plan, profile, planContext(profile, status.params, { max_shot_s: handle.maxShotS }));
+    } catch (err) {
+      throw new KunoError(0, "integrity", `The delivered plan breaks the plan rules: ${(err as Error).message}.`);
+    }
+    const info = receipt.body.plan;
+    if (info.shots !== plan.shots.length || Math.abs(info.duration_s - plan.duration_s) > 1e-6) {
+      throw new KunoError(0, "integrity", "The plan doesn't match the shots and length its receipt describes.");
+    }
+    return { jobId: handle.jobId, plan, json, receipt, privacy: handle.privacy };
+  }
+
+  private async startPlan(req: PlanRequest, revision: PlanRevision | null, onStage?: (stage: SubmitStage) => void): Promise<PlanHandle> {
+    const privacy: PrivacyMode = req.privacy ?? "private";
+    if (privacy !== "private" && privacy !== "standard") throw new KunoError(0, "invalid_privacy", 'privacy must be "private" or "standard".');
+    if (typeof req.brief !== "string" || (!revision && !req.brief.trim())) throw new KunoError(0, "brief_required", ERROR_CODES.brief_required);
+    if (typeof req.targetS !== "number" || !Number.isFinite(req.targetS)) throw new KunoError(0, "invalid_params", "targetS is the plan's length in seconds.");
+
+    onStage?.("routing");
+    const fit = { resolution: req.resolution, aspectRatio: req.aspectRatio, fps: req.fps };
+    const route = await this.route("plan", req.model ?? "ltx-2.5-fast", undefined, privacy, fit);
+    const profile = (await this.models(0)).models.find((m) => m.id === route.profile_id);
+    if (!profile) throw new KunoError(404, "unknown_model", `Unknown model ${route.profile_id}.`);
+    const limits = profile.limits.plan;
+    const board = profile.limits.storyboard;
+    if (!profile.modes.includes("plan") || !limits || !board) throw new KunoError(0, "invalid_params", `${profile.name} doesn't write plans.`);
+    const params = fitParams(profile, "plan", [], { ...req, durationS: req.targetS }, route.fallback_reason);
+    const fail = (code: string, message: string): never => {
+      throw new KunoError(0, code, message);
+    };
+    if (!(limits.min_target_s <= params.duration_s && params.duration_s <= board.max_total_s)) {
+      fail("invalid_params", `a plan's target duration must be between ${limits.min_target_s} and ${board.max_total_s} seconds`);
+    }
+    if (!profile.limits.sizes[params.resolution]?.[params.aspect_ratio]) fail("invalid_params", `${profile.name} doesn't render ${params.resolution} at ${params.aspect_ratio}`);
+    if (!profile.limits.fps.includes(params.fps)) fail("invalid_params", `fps must be one of ${profile.limits.fps.join(", ")}`);
+    const maxBrief = limits.max_brief_chars ?? 4000;
+    const maxStyle = limits.max_style_chars ?? 500;
+    if ([...req.brief].length > maxBrief) fail("prompt_too_long", `A brief is limited to ${maxBrief.toLocaleString("en-US")} characters on ${profile.name}.`);
+    if (req.style && [...req.style].length > maxStyle) fail("prompt_too_long", `A style is limited to ${maxStyle.toLocaleString("en-US")} characters on ${profile.name}.`);
+
+    // Only workers that list plan/1 can open a plan job: an older one would leave it to time out.
+    const fitting = route.enclaves.filter((e) => e.features?.includes(PLAN_FEATURE) && envelopeFits(e.envelope, params));
+    if (privacy === "private" && !fitting.length) {
+      const unlisted = route.enclaves.length > 0 && route.enclaves.every((e) => e.features === undefined);
+      throw new KunoError(
+        503,
+        "plans_unavailable",
+        unlisted
+          ? "This gateway doesn't say which workers write plans, so the brief wasn't sent: a worker that can't write plans would leave the job to time out. Nothing was charged."
+          : `No confidential worker that writes plans for ${profile.name} at this size is online right now. Nothing was sent or charged.`,
+      );
+    }
+    const maxShotS = longestServedShot(profile, params, fitting);
+
+    let revise: PlanRevision | null = null;
+    if (revision) {
+      const numbers = revision.shots == null ? null : [...new Set(revision.shots)].sort((a, b) => a - b);
+      if (numbers && (!numbers.length || numbers.some((n) => !Number.isInteger(n) || n < 1))) fail("invalid_plan", "Shots to revise are numbered from 1.");
+      revise = { plan: cleanPlan(restitchPlan(profile, cleanPlan(revision.plan))), instruction: revision.instruction ?? "", shots: numbers };
+    }
+    const options: PlanOptions = { v: 1, min_shots: 2 };
+    if (req.style) options.style = req.style;
+    if (maxShotS !== null) options.max_shot_s = maxShotS;
+    if (revise) options.revise = revise;
+    let context;
+    try {
+      context = planContext(profile, params, options);
+    } catch (err) {
+      throw new KunoError(503, "no_capacity", `No worker can plan shots for this size and frame rate: ${(err as Error).message}.`);
+    }
+    if (revise) checkRevision(revise, context);
+
+    if (privacy === "standard") {
+      onStage?.("submitting");
+      const { style: _style, ...rest } = options;
+      const status = await this.json<JobStatus>("POST", "/v1/standard/plans", {
+        job_id: crypto.randomUUID(),
+        params,
+        brief: req.brief,
+        ...(req.style ? { style: req.style } : {}),
+        options: rest,
+        ...(req.seed !== undefined ? { seed: req.seed } : {}),
+      });
+      return {
+        kind: "plan", jobId: status.job_id, privacy: "standard", profileId: status.params?.profile_id ?? profile.id, enclaveId: status.enclave_id ?? "",
+        maxShotS, fallbackReason: route.fallback_reason, createdAt: status.created_at ?? Date.now() / 1000,
+      };
+    }
+
+    onStage?.("verifying");
+    const enclave = await this.pickEnclave({ ...route, enclaves: fitting }, params);
+    onStage?.("encrypting");
+    const jobId = crypto.randomUUID();
+    const session = await openSenderSession(b64d(enclave.hpke_public_key));
+    const payload = { v: 1, prompt: req.brief, negative_prompt: null, seed: req.seed ?? null, inputs: [], options: { [PLAN_OPTION]: options } };
+    let plaintext: Uint8Array;
+    try {
+      plaintext = padPayload(utf8(JSON.stringify(payload)));
+    } catch (err) {
+      if (err instanceof RangeError) throw new KunoError(0, "request_too_large", `The request is too large to seal: ${err.message}.`);
+      throw err;
+    }
+    const ciphertext = await session.seal(plaintext, jobAad(jobId, enclave.enclave_id, params, []));
+    onStage?.("submitting");
+    await this.json("POST", "/v1/videos", { job_id: jobId, params, enclave_id: enclave.enclave_id, enc: b64e(session.enc), ciphertext: b64e(ciphertext), input_blob_ids: [] });
+    return {
+      kind: "plan", jobId, privacy: "private", profileId: profile.id, enclaveId: enclave.enclave_id, outputKey: b64e(session.outputKey),
+      signingPublicKey: enclave.signing_public_key, maxShotS, fallbackReason: route.fallback_reason, createdAt: Date.now() / 1000,
+    };
   }
 
   // ------------------------------------------------------------ standard library

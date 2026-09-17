@@ -280,6 +280,54 @@ result.save("harbor.mp4")
 - **Seeds.** Shot *i* (from 0) renders with seed `(seed + i) mod 2^31`.
 - **Not verified yet.** Storyboards carry no step commitment, so validators don't step-audit them.
 
+## Plans from a brief (Director)
+
+`kuno.plan(brief, target_s=...)` has a storyboard written for you: a scene and 2 to 12 shots, each with a beat (a short
+label), a prompt, a length and a join, fitted to `target_s` seconds (4 to 120). The planner is the small language model
+bundled with LTX-2.5, run inside a confidential worker, so nothing renders and the plan is a first draft: read it, edit
+it, have shots rewritten, then render it as the storyboard above.
+
+```python
+plan = kuno.plan(
+    'A 30-second ad for a small coffee roastery, warm and handmade. End on "Roasted this morning."',
+    target_s=30, style="35mm film, warm",                 # model="ltx-2.5-fast", privacy="private" by default
+)
+print(plan.title, plan.duration_s, plan.repairs)          # 30.375 s; every change code made to the planner's text
+for shot in plan.shots:
+    print(shot.beat, shot.duration_s, shot.join, shot.prompt)
+
+plan.shots[3].prompt += " The camera slowly pushes in."   # edit freely
+plan = kuno.revise_plan(plan, "darker, at night", shots=[2])   # rewrite shot 2 only; the rest comes back unchanged
+video = kuno.generate(plan=plan, max_price_usd=5)          # renders exactly this storyboard
+```
+
+- **`Plan`** is Plan v1 (`kuno_protocol.plans.Plan`): `profile_id`, `resolution`, `aspect_ratio`, `fps`, `audio`,
+  `target_s`, `duration_s` (the shots' exact stitched length), `title`, `scene`, `shots`, `notes`, `repairs` and
+  `planner`, plus `job_id`, `receipt` and `privacy`. `plan.to_shots()` gives the `Shot`s; `plan.to_json()` its canonical
+  JSON, which `Plan.model_validate_json` reads back.
+- **`generate(plan=plan)`** renders it as a storyboard: the scene is the prompt, the shots are the shots, and the plan's
+  model, size, frame rate and sound are the job's. Pass no prompt, shots or `duration_s` with it; a model, resolution,
+  aspect ratio or fps given must be the plan's (`invalid_params`). `quote(plan=plan)` and `estimate_price(plan=plan)`
+  price the render.
+- **`revise_plan(plan, instruction, shots=None)`** is a new plan job with the same frame and target. With `shots`
+  (numbered from 1) only those shots are rewritten, and only their lengths move; without, the whole plan is. Edited shot
+  lengths are measured again before it is sent; a plan that breaks the rules is refused as `invalid_plan` first. It
+  takes a `Plan`, its dict or its JSON, and keeps the plan's privacy unless you pass one.
+- **Private** (the default) routes only to attested workers whose `/v1/route` entry lists the `plan/1` feature, and
+  seals the brief and style on this machine. The client asks for shots no longer than the longest those workers render
+  at this size and frame rate (`options.plan.max_shot_s`), the rule the storyboard is later routed by. It opens the
+  sealed plan here, refusing anything but padded plan JSON, and checks it against the enclave-signed receipt and the
+  plan rules (`kuno_protocol.plans.validate`). The gateway sees the target length, the frame, the price, the status and
+  the receipt; never the brief or the plan. No worker that writes plans: `plans_unavailable`, before anything is sent.
+- **Standard** (`privacy="standard"`) sends the brief and style to `POST /v1/standard/plans`, readable by KunoWorld,
+  which checks them against the content policy and keeps the plan until you delete it; the client reads it back from
+  `GET /v1/standard/plans/{job_id}` and checks it against the receipt's `content_digest`.
+- **Price.** A plan costs a flat price whatever its length: `kuno.quote("ltx-2.5-fast", mode="plan", duration_s=30)`
+  (`breakdown.plan_usd`), or `estimate_price(..., mode="plan")`. `max_price_usd` works as for videos. A plan the planner
+  couldn't write (`plan_failed`) or that was blocked (`safety_blocked`) is refunded.
+- **Waiting.** Plans take seconds to about a minute (stages `planning`, then `checking`). `wait=False` returns a
+  `PlanJob`; `job.export()` holds a Private job's output key, `PlanJob.restore(kuno, data).wait()` finishes it later.
+
 ## Prices, quotes and budgets
 
 `kuno.quote(...)` asks the gateway for the exact price of a job before anything is encrypted or sent
@@ -422,10 +470,12 @@ and Cursor's `~/.cursor/mcp.json` (or `.cursor/mcp.json` in a project) take the 
 
 | Tool | What it does |
 |---|---|
-| `list_models` | models with their modes, durations, sizes, frame rates, storyboard limits, availability and prices per second in both modes |
+| `list_models` | models with their modes, durations, sizes, frame rates, storyboard and plan limits, availability, prices per second in both modes and the flat plan price |
 | `quote_price` | the exact price of a job, the model that would serve it, the settings priced and a breakdown. The same arguments as `generate_video`, without the prompt; shot prompts aren't sent |
-| `generate_video` | quotes, refuses over budget (`max_price_usd`, `KUNOWORLD_MAX_JOB_USD`), then submits and returns the job id; with `wait=true`, waits with progress notifications and saves the video. Takes the prompt, model or family, mode, duration, resolution, aspect ratio, fps, audio, seed, privacy, first-frame, last-frame and reference-image paths, and `shots` for a storyboard |
-| `get_job` | status, stage (`shot 3/8` while a storyboard renders), progress, price and any error |
+| `generate_video` | quotes, refuses over budget (`max_price_usd`, `KUNOWORLD_MAX_JOB_USD`), then submits and returns the job id; with `wait=true`, waits with progress notifications and saves the video. Takes the prompt, model or family, mode, duration, resolution, aspect ratio, fps, audio, seed, privacy, first-frame, last-frame and reference-image paths, and `shots` for a storyboard, or `plan_id` to render a plan as its storyboard (privacy defaults to the plan's) |
+| `plan_video` | writes an editable storyboard from a brief in a confidential worker, at a flat price and under the same budget rule; nothing renders. Takes the brief, `target_s`, model, size, frame rate, sound, style, privacy and `max_price_usd`. Waits by default and returns the plan compactly (title, scene, shots with lengths and joins, stitched length, notes, repairs), its `plan_id`, and `render_price`, the quote for rendering it |
+| `revise_plan` | rewrites a plan under an instruction: only the listed `shots`, or all of them. Takes `plan_id`, or the plan itself as `plan_video` returned it (edited or not), and returns a new plan with its own `plan_id` |
+| `get_job` | status, stage (`shot 3/8` while a storyboard renders, `planning` or `checking` for a plan), progress, price and any error; a finished plan comes back with the plan and its render price |
 | `download_video` | checks the video against its signed receipt, decrypts a Private video here, and saves it with its receipt; returns the path, size, SHA-256 and a receipt summary |
 | `cancel_job` | cancels an unfinished job, which is refunded |
 | `list_jobs` | the jobs this server started, newest first |
@@ -443,8 +493,10 @@ KunoWorld, how to write prompts for LTX-2.5 and MiniMax H3, and how to plan stor
   video. The server writes it to `KUNOWORLD_JOBS_DIR/<job_id>.json` before sending the job, in a directory only you can
   open (0700), readable only by you (0600). Handles go nowhere else, and no tool returns a key. Back the directory up
   and guard it like a password: KunoWorld can't recover a lost key.
-- **No prompt is stored or logged.** A handle keeps the job's settings, price and status, not its prompt or shots. The
-  server logs only warnings, to stderr, and none carries a prompt or a key.
+- **No prompt or brief is stored or logged.** A handle keeps the job's settings, price and status, not its prompt or
+  shots. A plan job's handle also keeps the finished plan (its scene and shot prompts, as the worker wrote them), so the
+  assistant can revise or render it by `plan_id`; in Private mode that file is its only readable copy outside the
+  conversation. The server logs only warnings, to stderr, and none carries a prompt or a key.
 - **Videos** are saved readable only by you (0600), as `kunoworld-<job_id>.mp4` or a name the assistant gives, next to
   `<name>.receipt.json`. A different file already there is never overwritten.
 - **Attestation.** Without `KUNOWORLD_OWNER_PUBLIC_KEY` or `KUNOWORLD_MANIFEST`, workers are checked against the manifest
@@ -470,9 +522,11 @@ NVIDIA rotates it; `country` is for development gateways only. Call `close()` wh
 | `models()` / `profile(profile_id)` | model profiles, availability and the switch |
 | `manifest()` | the golden manifest in use |
 | `route(mode, model=None, family=None, privacy="private", *, resolution=None, aspect_ratio=None, fps=None, duration_s=None)` | which profile and enclaves would serve a request; the size, frame rate and duration list only workers whose hardware can fit them (their serving envelope). `generate`, `prepare` and `submit_standard` send the request's own |
-| `generate(prompt, ..., shots=None, privacy="private", max_price_usd=None)` | private: route, verify, encrypt, submit; standard: upload, create. Waits by default. With `shots`, a storyboard; with `max_price_usd`, `over_budget` before anything is sent when the quote is over it |
-| `quote(model=None, *, family=None, mode=None, duration_s=None, shots=None, resolution=None, aspect_ratio=None, fps=None, audio=True, input_roles=None, privacy="private")` | the gateway's exact price for such a job now, as a `Quote`: `price_usd`, `profile_id`, `fallback_reason`, `params`, `breakdown`, `placeholder`, `balance_usd` |
-| `estimate_price(model, *, duration_s=None, shots=None, resolution=None, aspect_ratio=None, fps=None, privacy="private")` | what such a job would cost, computed locally from the published prices; a storyboard's stitched seconds |
+| `generate(prompt, ..., shots=None, privacy="private", max_price_usd=None, plan=None)` | private: route, verify, encrypt, submit; standard: upload, create. Waits by default. With `shots`, a storyboard; with `plan`, that plan's storyboard; with `max_price_usd`, `over_budget` before anything is sent when the quote is over it |
+| `plan(brief, *, target_s, model="ltx-2.5-fast", resolution=None, aspect_ratio=None, fps=None, audio=True, style=None, privacy="private", seed=None, max_price_usd=None, wait=True, timeout=600.0, on_progress=None)` | a storyboard `Plan` written from a brief in a confidential worker (a `PlanJob` with `wait=False`) |
+| `revise_plan(plan, instruction="", shots=None, *, brief="", style=None, privacy=None, seed=None, max_price_usd=None, wait=True, ...)` | a plan rewritten under an instruction: only the listed shots, or all of them |
+| `quote(model=None, *, family=None, mode=None, duration_s=None, shots=None, resolution=None, aspect_ratio=None, fps=None, audio=True, input_roles=None, privacy="private", plan=None)` | the gateway's exact price for such a job now, as a `Quote`: `price_usd`, `profile_id`, `fallback_reason`, `params`, `breakdown`, `placeholder`, `balance_usd` |
+| `estimate_price(model=None, *, duration_s=None, shots=None, resolution=None, aspect_ratio=None, fps=None, privacy="private", mode=None, plan=None)` | what such a job would cost, computed locally from the published prices; a storyboard's stitched seconds, a plan's flat price (`mode="plan"`), or rendering a `plan` |
 | `status(job_id)` / `cancel(job_id)` | a job's `JobStatus`, or cancel it (refunded), in either mode |
 | `prepare(...)` / `submit(prepared)` | the private path, in two steps |
 | `submit_standard(prompt, ...)` / `upload_standard(role, data, mime)` | the standard path, in pieces |

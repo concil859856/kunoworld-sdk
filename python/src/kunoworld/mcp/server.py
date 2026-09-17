@@ -40,6 +40,8 @@ INSTRUCTIONS = f"""KunoWorld makes videos with audio from text, images or a stor
 
 Workflow: list_models to choose a model and settings; quote_price for the exact price; tell the user the price and get
 their agreement; generate_video with max_price_usd; get_job until it has succeeded; download_video to save it locally.
+For a longer video from a brief, plan_video writes an editable storyboard first (a flat price, nothing rendered): show
+it to the user, adjust it with revise_plan, then render it with generate_video and its plan_id.
 Sexual content is banned in both modes, and blocked requests count against the account.
 
 {PRIVACY_NOTE}"""
@@ -99,6 +101,20 @@ LastFrame = Annotated[str | None, Field(description="Path to an image on this co
 References = Annotated[list[str] | None, Field(description="Paths to reference images on this computer (MiniMax H3 Director "
                                                "only).")]
 JobId = Annotated[str, Field(description="The job_id generate_video or list_jobs returned.")]
+PlanId = Annotated[str | None, Field(description="The plan_id plan_video or revise_plan returned. The plan is kept on this "
+                                     "computer by this server.")]
+PlanWait = Annotated[bool, Field(description="Wait for the plan (seconds to a minute) and return it. With false, follow it "
+                                 "with get_job.")]
+PlanTimeout = Annotated[float, Field(gt=0, le=3600, description="With wait: how long to wait, in seconds.")]
+
+PLAN_RULES = (
+    "The plan is written inside a confidential worker by LTX-2.5's small bundled language model, so treat it as a first "
+    "draft: read it with the user. Each shot's prompt is what the video model renders after the scene; joins are fresh "
+    "(new moment), cut (new angle, sound carries on) or continue (the same take goes on, same shot size). The shots are "
+    "fitted to the target length and to the longest shot the workers render at this size, and every change code made to "
+    "the planner's text is listed in repairs. Planning is optional: you can write the scene and shots yourself and pass "
+    "them to generate_video."
+)
 
 
 def _wrap(tools: KunoTools) -> Callable[..., Any]:
@@ -112,6 +128,17 @@ def _wrap(tools: KunoTools) -> Callable[..., Any]:
             raise ToolError(f"network: couldn't reach KunoWorld at {tools.config.api_url} ({type(exc).__name__}).") from None
 
     return call
+
+
+def _progress(ctx: Context) -> Callable[[Any], None]:
+    """Sends a job's status to the client as MCP progress, from the worker thread the SDK runs in."""
+
+    def on_status(status) -> None:
+        state = status.status.value
+        message = f"{state}: {status.stage}" if status.stage and status.stage != state else state
+        anyio.from_thread.run(ctx.report_progress, status.progress, 1.0, message)
+
+    return on_status
 
 
 def build_server(config: Config | None = None, tools: KunoTools | None = None) -> FastMCP:
@@ -181,8 +208,9 @@ def build_server(config: Config | None = None, tools: KunoTools | None = None) -
     )
     async def generate_video(
         ctx: Context,
-        prompt: Annotated[str, Field(description="What to show and hear: subject, action, setting, camera, lighting, sound, "
-                                     "quoted dialogue. For a storyboard, the scene all shots share (may be empty).")],
+        prompt: Annotated[str | None, Field(description="What to show and hear: subject, action, setting, camera, lighting, "
+                                            "sound, quoted dialogue. For a storyboard, the scene all shots share (may be "
+                                            "empty). Required unless plan_id is given.")] = None,
         max_price_usd: Annotated[float | None, Field(description="The most this video may cost, in US dollars, as agreed with "
                                                      "the user. Required unless KUNOWORLD_MAX_JOB_USD is set; it can only "
                                                      "lower that cap.")] = None,
@@ -205,20 +233,84 @@ def build_server(config: Config | None = None, tools: KunoTools | None = None) -
                                     "some hosts time tool calls out: prefer false and get_job.")] = False,
         timeout_s: Annotated[float, Field(gt=0, le=7200, description="With wait: how long to wait, in seconds. The job goes on "
                                           "after that.")] = 1800.0,
+        plan_id: Annotated[str | None, Field(description="Render a plan from plan_video or revise_plan as its storyboard: its "
+                                             "scene, shots, model, size, frame rate and sound. Pass no prompt, shots or "
+                                             "duration with it. Privacy defaults to the plan's.")] = None,
     ) -> dict[str, Any]:
-        on_status = None
-        if wait:
-            def on_status(status) -> None:
-                state = status.status.value
-                message = f"{state}: {status.stage}" if status.stage and status.stage != state else state
-                anyio.from_thread.run(ctx.report_progress, status.progress, 1.0, message)
-
         return await call(
             tools.generate_video, prompt=prompt, model=model, family=family, mode=mode, duration_s=duration_s,
             resolution=resolution, aspect_ratio=aspect_ratio, fps=fps, audio=audio, seed=seed, privacy=privacy,
             first_frame_path=first_frame_path, last_frame_path=last_frame_path, reference_image_paths=reference_image_paths,
             shots=None if shots is None else [shot.model_dump() for shot in shots], max_price_usd=max_price_usd, wait=wait,
-            timeout_s=timeout_s, on_status=on_status,
+            timeout_s=timeout_s, on_status=_progress(ctx) if wait else None, plan_id=plan_id,
+        )
+
+    @server.tool(
+        name="plan_video",
+        title="Plan a storyboard from a brief",
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
+        description="Turn a brief (\"a 30-second ad for a small coffee roastery, warm and handmade\") into an editable storyboard "
+        "plan: a title, a scene every shot shares, and 2 to 12 shots with prompts, lengths and joins, fitted to target_s. "
+        "Nothing is rendered. This spends the user's credit: a flat price per plan whatever its length (list_models shows "
+        "plan.usd; placeholders now, about $0.10 Private and $0.08 Standard), refused before anything is charged if over "
+        "max_price_usd (required unless the server sets KUNOWORLD_MAX_JOB_USD). A plan that fails (plan_failed) or is "
+        "blocked is refunded. Returns the plan compactly, its plan_id, and render_price, the price of rendering it. Then "
+        "revise_plan or generate_video with plan_id.\n\n" + PLAN_RULES + "\n\n" + PRIVACY_NOTE,
+    )
+    async def plan_video(
+        ctx: Context,
+        brief: Annotated[str, Field(description="What the video is for, what happens and how it should feel. Put words to be "
+                                    "spoken or a slogan in quotes. At most 4,000 characters.")],
+        target_s: Annotated[float, Field(ge=4, le=120, description="The stitched length to aim for, in seconds (LTX-2.5 Fast: 4 "
+                                         "to 120).")] = 30.0,
+        max_price_usd: Annotated[float | None, Field(description="The most this plan may cost, in US dollars, as agreed with "
+                                                     "the user. Required unless KUNOWORLD_MAX_JOB_USD is set.")] = None,
+        model: Annotated[str | None, Field(description="The model the storyboard will render on. Plans are written for "
+                                           "ltx-2.5-fast.")] = "ltx-2.5-fast",
+        resolution: Resolution = None,
+        aspect_ratio: Aspect = None,
+        fps: Fps = None,
+        audio: Audio = True,
+        style: Annotated[str | None, Field(description="A look to keep to, e.g. '35mm film, warm'. At most 500 characters.")] = None,
+        privacy: PrivacyArg = None,
+        seed: Annotated[int | None, Field(ge=0, le=2**31 - 1, description="Seeds the planner.")] = None,
+        wait: PlanWait = True,
+        timeout_s: PlanTimeout = 300.0,
+    ) -> dict[str, Any]:
+        return await call(
+            tools.plan_video, brief=brief, target_s=target_s, model=model, resolution=resolution, aspect_ratio=aspect_ratio,
+            fps=fps, audio=audio, style=style, privacy=privacy, seed=seed, max_price_usd=max_price_usd, wait=wait,
+            timeout_s=timeout_s, on_status=_progress(ctx) if wait else None,
+        )
+
+    @server.tool(
+        name="revise_plan",
+        title="Revise a storyboard plan",
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
+        description="Rewrite a plan in the confidential worker under an instruction (\"make shot 3 a close-up, darker\"). With "
+        "shots (numbered from 1) only those shots are rewritten, and the title, scene, notes and other shots come back "
+        "unchanged; without it the whole plan is rewritten. Pass plan_id for a plan this server made, or plan: the plan as "
+        "plan_video returned it, edited if you like (shot lengths are re-measured). A revision is a new plan with its own "
+        "plan_id, at the plan price, under the same budget rule as plan_video.\n\n" + PLAN_RULES + "\n\n" + PRIVACY_NOTE,
+    )
+    async def revise_plan(
+        ctx: Context,
+        instruction: Annotated[str, Field(description="What to change. May be empty for a different take.")] = "",
+        plan_id: PlanId = None,
+        plan: Annotated[dict[str, Any] | None, Field(description="The plan itself, as plan_video returned it (or Plan v1 "
+                                                     "JSON), when it has no plan_id here or you edited it.")] = None,
+        shots: Annotated[list[int] | None, Field(description="Only rewrite these shots, numbered from 1.")] = None,
+        max_price_usd: Annotated[float | None, Field(description="The most this revision may cost, in US dollars. Required "
+                                                     "unless KUNOWORLD_MAX_JOB_USD is set.")] = None,
+        style: Annotated[str | None, Field(description="A look to keep to.")] = None,
+        privacy: PrivacyArg = None,
+        seed: Annotated[int | None, Field(ge=0, le=2**31 - 1, description="Seeds the planner.")] = None,
+        wait: PlanWait = True,
+        timeout_s: PlanTimeout = 300.0,
+    ) -> dict[str, Any]:
+        return await call(
+            tools.revise_plan, instruction=instruction, plan_id=plan_id, plan=plan, shots=shots, style=style, privacy=privacy,
+            seed=seed, max_price_usd=max_price_usd, wait=wait, timeout_s=timeout_s, on_status=_progress(ctx) if wait else None,
         )
 
     @server.tool(
@@ -226,8 +318,9 @@ def build_server(config: Config | None = None, tools: KunoTools | None = None) -
         title="Check a video job",
         annotations=read_only,
         description="A job's status: queued, running, succeeded, failed or canceled; its stage (a storyboard reads 'shot 3/8' "
-        "while it renders); progress from 0 to 1; the price held; and, when it failed, the error code. A failed or canceled "
-        "job is refunded automatically. Poll every 15 to 30 seconds while it runs.",
+        "while it renders, a plan 'planning' then 'checking'); progress from 0 to 1; the price held; and, when it failed, "
+        "the error code. A finished plan comes back with the plan and the price of rendering it. A failed or canceled job is "
+        "refunded automatically. Poll every 15 to 30 seconds while a video renders, every few seconds for a plan.",
     )
     async def get_job(job_id: JobId) -> dict[str, Any]:
         return await call(tools.get_job, job_id=job_id)

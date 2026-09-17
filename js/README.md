@@ -288,6 +288,57 @@ const { video } = await kuno.wait(job, {
 
 `params.shots` exists only on storyboards, so every other job's encrypted request is byte-for-byte what it was.
 
+## Plans from a brief (Director)
+
+`kuno.plan(...)` has a storyboard written for you: a scene and 2 to 12 shots, each with a `beat` (a short label), a
+prompt, a length and a join, fitted to `targetS` seconds (4 to 120). The planner is the small language model bundled
+with LTX-2.5, run inside a confidential worker, so nothing renders and the plan is a first draft: read it, edit it, have
+shots rewritten, then render it as a storyboard.
+
+```js
+import { planToShots } from "@kunoworld/sdk";
+
+const { plan, receipt } = await kuno.plan({
+  brief: 'A 30-second ad for a small coffee roastery, warm and handmade. End on "Roasted this morning."',
+  targetS: 30,
+  style: "35mm film, warm",           // model: "ltx-2.5-fast" and privacy: "private" by default
+});
+console.log(plan.title, plan.duration_s, plan.repairs);   // every change code made to what the planner wrote
+
+plan.shots[3].prompt += " The camera slowly pushes in.";
+const { plan: revised } = await kuno.revisePlan(plan, "darker, at night", { shots: [2] });   // shot 2 only
+
+const job = await kuno.submit({
+  prompt: revised.scene,
+  shots: planToShots(revised),        // [{ prompt, durationS, join }]: the same specs and stitched length
+  model: revised.profile_id, resolution: revised.resolution, aspectRatio: revised.aspect_ratio,
+  fps: revised.fps, audio: revised.audio,
+});
+```
+
+- **`Plan`** is Plan v1: `profile_id`, `resolution`, `aspect_ratio`, `fps`, `audio`, `target_s`, `duration_s` (the
+  shots' exact stitched length), `title`, `scene`, `shots: [{ beat, prompt, duration_s, join }]`, `notes`, `repairs` and
+  `planner`. `planStoryboardParams(plan)` is the storyboard's params; `planShotSpecs`, `restitchPlan(profile, plan)`
+  (after editing lengths) and `parsePlan(json)` help around it.
+- **Private** (the default) routes only to attested workers whose route entry lists `plan/1` (`PLAN_FEATURE`), asks for
+  shots no longer than the longest those workers render at this size and frame rate (`options.plan.max_shot_s`, the
+  rule the storyboard is routed by), and seals the brief and style here. `planResult` downloads the sealed plan, checks
+  it against the enclave-signed receipt, decrypts it, refuses anything but padded plan JSON (`openPlan`), checks
+  `content_digest` and runs `validatePlan`. The gateway sees the target length, the frame, the price, the status and
+  the receipt; never the brief or the plan. No worker that writes plans: `plans_unavailable`, before anything is sent.
+- **Standard** (`privacy: "standard"`) sends the brief to `POST /v1/standard/plans`, readable by KunoWorld, and reads
+  the stored plan back from `GET /v1/standard/plans/{jobId}`, checked against the receipt's `content_digest`.
+- **Revisions.** `revisePlan(plan, instruction, { shots })` is a new plan job with the same frame and target: with
+  `shots` (numbered from 1) only those shots are rewritten and only their lengths move. The plan may be edited first: it
+  is sent with exactly Plan v1's fields and its stitched length measured again, and one that breaks the rules is refused
+  as `invalid_plan` before anything is sent.
+- **Price.** Flat, whatever the length: `priceQuote(profile, { mode: "plan", resolution, duration_s, fps }, privacy)`
+  or `planPriceUsd(profile, privacy)`. `plan_failed` (the planner wrote nothing usable) and `safety_blocked` are refunded.
+- **Waiting.** Plans take seconds to about a minute (stages `planning`, then `checking`). `submitPlan` returns a
+  `PlanHandle` (a Private one holds the output key: store it like a password), and `waitPlan(handle)` finishes it.
+- **Checks shared with Python.** `planContext`, `fitPlan`, `validatePlan`, `briefQuotes`, `missingQuotes`, `openPlan` and
+  `encodePlan` port `kuno_protocol.plans`, and the shared `plans` vectors pin them.
+
 ## Elements: reusable characters, products, locations and voices
 
 An Element is a named character, product, location, style or voice you reuse across videos: 1 to 4 images (or one
@@ -406,6 +457,9 @@ Verification options:
 | `generate(request, { onStage, ...waitOptions })` | `submit` then `wait` |
 | `wait(handle, { onProgress, signal, pollMs, timeoutMs })` | poll to completion, then fetch the video (verified and decrypted for private jobs) |
 | `result(handle, status?)` | fetch a finished job's video |
+| `plan(request, { onStage, ...waitOptions })` / `submitPlan(request, onStage?)` | a storyboard plan from `{ brief, targetS, model?, resolution?, aspectRatio?, fps?, audio?, style?, privacy?, seed? }`: waited for and checked (`PlanResult`: `plan`, `json`, `receipt`), or its `PlanHandle` |
+| `revisePlan(plan, instruction?, { shots, brief, style, privacy, seed, ...waitOptions })` / `submitRevision(...)` | the plan rewritten: only the listed shots, or all of them |
+| `waitPlan(handle, waitOptions)` / `planResult(handle, status?)` | wait for a plan job, or open a finished one |
 | `status(jobId)` / `list(limit = 50)` | job status (including `privacy`), or your recent jobs |
 | `cancel(jobId)` | request cancellation. Stopping polling does not cancel a job |
 | `delete(jobId)` | delete a job's stored content, in either mode (`DELETE /v1/videos/{id}`) |
@@ -431,7 +485,9 @@ Element helpers: `deriveElementsKey`, `parseElementsKey` / `formatElementsKey`, 
 `wrapElementKey`, `rewrapElementKey` for a key sync rotation) with `ELEMENT_RULES` and `ELEMENT_LIMITS`.
 
 Storyboard helpers mirror kuno_protocol: `storyboardDurationS`, `storyboardFrames`, `storyboardTrimFrames`, `numFrames`,
-`shotPrompt`, `renderDurationS`, `validateStoryboard` and `storyboardStage` (see "Storyboards").
+`shotPrompt`, `renderDurationS`, `validateStoryboard` and `storyboardStage` (see "Storyboards"). Plan helpers: `planToShots`,
+`planStoryboardParams`, `planShotSpecs`, `restitchPlan`, `planPriceUsd`, `planContext`, `fitPlan`, `validatePlan`,
+`briefQuotes`, `missingQuotes`, `parsePlan`, `encodePlan`, `openPlan` and `planOutputLabel` (see "Plans from a brief").
 
 Failures throw `KunoError` with the HTTP `status`, a machine-readable `code`, and the rest of the
 error body in `details` (with `reasons` and `restrictedUntil` getters). The package also exports

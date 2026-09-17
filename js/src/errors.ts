@@ -75,6 +75,14 @@ export const ERROR_CODES = {
   invalid_element: "The Element doesn't fit the rules: its name, description, kind, files or consent record.",
   consent_withdrawn: "The person in this Element withdrew consent, so it can't be used in new videos.",
   rules_not_affirmed: "Storing an Element affirms the Elements rules: no public figures, no one under 18, consent for real people, nothing sexual.",
+  plan_failed: "The planner couldn't write a usable plan for this brief. The plan was refunded; try rephrasing the brief.",
+  plans_unavailable: "No confidential worker that writes plans (feature plan/1) is available, so nothing was sent or charged.",
+  invalid_plan: "The plan doesn't keep to its model's rules (shots, lengths, joins or text limits), so it wasn't sent.",
+  brief_required: "A plan needs a brief: what the video is for, what happens and how it should feel.",
+  invalid_brief: "A Standard plan needs a brief; only a revision may leave it empty.",
+  invalid_options: "The plan options don't fit the job (the longest shot, the shot counts, or the plan to revise).",
+  envelope_exceeded: "The chosen worker's hardware doesn't serve this size and frame rate. Nothing was charged; ask for a route again.",
+  prompt_too_long: "A prompt or brief is over the model's limit; for a storyboard, the scene and one shot's prompt together.",
 } as const;
 
 export type KunoErrorCode = keyof typeof ERROR_CODES;

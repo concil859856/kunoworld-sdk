@@ -5,6 +5,11 @@ params the SDK would fill in; a private job is really opened with the enclave's 
 sealed), rendered as a few bytes, sealed to the job's output key and receipted with the enclave's signing key; each
 status poll moves a job one stage on, through `shot i/N` for a storyboard. The client it makes skips attestation, which
 has its own tests: `_pick_enclave` returns this enclave.
+
+Plans (mode `plan`): the enclave lists the `plan/1` feature; a plan job goes `planning`, `checking`, then writes a canned
+plan/1 reply from the brief (a revision's rewritten shots carry its instruction) and runs it through
+`kuno_protocol.plans.repair`, as the worker does, then seals it as `<job_id>/output/plan` with a receipt that has `plan`.
+`POST /v1/standard/plans` and `GET /v1/standard/plans/{job_id}` do the same readable. `plan_failure` fails plan jobs.
 """
 
 from __future__ import annotations
@@ -20,12 +25,13 @@ from kuno_protocol.attestation import enclave_id_for
 from kuno_protocol.blobs import encrypt_blob
 from kuno_protocol.canonical import b64d, b64e, sha256_hex
 from kuno_protocol.crypto import RecipientSession, generate_hpke_keypair, generate_signing_key, public_key_bytes
+from kuno_protocol.plans import PLAN_FEATURE, PLAN_OPTION, PlanOptions, encode_plan, plan_context, repair, seal_plan, suggested_shots
 from kuno_protocol.profiles import InputRole, Mode, example_roles, load_profiles
-from kuno_protocol.receipts import ReceiptBody, VideoInfo, sign_receipt
-from kuno_protocol.schemas import GenerationParams, JobCreate, job_aad, output_label
+from kuno_protocol.receipts import PlanInfo, ReceiptBody, VideoInfo, sign_receipt
+from kuno_protocol.schemas import GenerationParams, JobCreate, SealedPayload, job_aad, output_label
 from kuno_protocol.sealed_payload import open_payload
 from kunoworld import Input, KunoClient, Shot, infer_mode
-from kunoworld.client import _fit_params
+from kunoworld.client import _fit_params, _plan_params
 
 PROFILES = load_profiles()
 API_URL = "https://gw.test"
@@ -43,7 +49,7 @@ class FakeNetwork:
         signing_public = public_key_bytes(self.signing_key)
         self.enclave = {
             "enclave_id": enclave_id_for(hpke_public, signing_public), "hpke_public_key": b64e(hpke_public),
-            "signing_public_key": b64e(signing_public), "evidence": {}, "envelope": None,
+            "signing_public_key": b64e(signing_public), "evidence": {}, "envelope": None, "features": [PLAN_FEATURE],
         }
         self.calls: list[httpx.Request] = []
         self.quotes: list[dict] = []
@@ -53,6 +59,8 @@ class FakeNetwork:
         self.price_usd: float | None = None
         self.balance_usd = 25.0
         self.refuse: dict[str, httpx.Response] = {}
+        # A failure code (e.g. "plan_failed") every plan job ends in instead of a plan.
+        self.plan_failure: str | None = None
 
     # ------------------------------------------------------------ client
 
@@ -94,6 +102,13 @@ class FakeNetwork:
             return self.create_private(JobCreate.model_validate_json(request.content))
         if key == "POST /v1/standard/videos":
             return self.create_standard(json.loads(request.content))
+        if key == "POST /v1/standard/plans":
+            return self.create_standard_plan(json.loads(request.content))
+        if parts[:3] == ["v1", "standard", "plans"] and len(parts) == 4 and request.method == "GET":
+            job = self.jobs.get(parts[3])
+            if job is None or job.plan is None:
+                return detail(404, "not_found", "No such plan.")
+            return httpx.Response(200, content=encode_plan(job.plan), headers={"content-type": "application/json"})
         if parts[:2] == ["v1", "videos"] and len(parts) == 3 and request.method == "GET":
             return self.poll(parts[2])
         if parts[:2] == ["v1", "videos"] and len(parts) == 4 and parts[3] == "cancel":
@@ -115,6 +130,19 @@ class FakeNetwork:
         self.quotes.append(body)
         profile = PROFILES[body.get("profile_id") or "ltx-2.5-fast"]
         shots = body.get("shots")
+        privacy = body.get("privacy", "private")
+        if body.get("mode") == "plan":
+            params = _plan_params(profile, body["duration_s"], body.get("resolution"), body.get("aspect_ratio"), body.get("fps"), body.get("audio", True), None)
+            price = self.price_usd if self.price_usd is not None else profile.price_usd(params, privacy)
+            # A flat price: no per-second terms in the breakdown.
+            return httpx.Response(200, json={
+                "price_usd": price, "currency": "USD", "privacy": privacy, "profile_id": profile.id, "profile_name": profile.name,
+                "requested_profile_id": body.get("profile_id"), "fallback_reason": None, "params": params.model_dump(mode="json"),
+                "breakdown": {"usd_per_second": None, "billable_seconds": 0.0, "fps_multiplier": 1.0, "long_clip_over_s": None,
+                              "long_clip_multiplier": 1.0, "subtotal_usd": price, "min_job_usd": profile.pricing.min_job_usd,
+                              "minimum_applied": False, "plan_usd": price},
+                "placeholder": True, "balance_usd": self.balance_usd, "balance_covers": self.balance_usd >= price,
+            })
         if shots is not None:
             mode = Mode.STORYBOARD
         else:
@@ -126,7 +154,6 @@ class FakeNetwork:
             body.get("aspect_ratio"), body.get("fps"), body.get("audio", True), None,
             shots=None if shots is None else [Shot("-", s.get("duration_s"), s.get("join")) for s in shots],
         )
-        privacy = body.get("privacy", "private")
         price = self.price_usd if self.price_usd is not None else profile.price_usd(params, privacy)
         rate = (profile.pricing.usd_per_second if privacy == "private" else profile.pricing.standard_usd_per_second)[params.resolution]
         return httpx.Response(200, json={
@@ -143,10 +170,15 @@ class FakeNetwork:
     def _job(self, job_id: str, params: GenerationParams, privacy: str, **extra) -> SimpleNamespace:
         count = len(params.shots or [])
         stages = [("queued", None, 0.0)]
-        stages += [("running", f"shot {i}/{count}", (i - 1) / count) for i in range(1, count + 1)] if count else [("running", "rendering", 0.5)]
-        stages += [("succeeded", "done", 1.0)]
+        if params.mode is Mode.PLAN:
+            stages += [("running", "planning", 0.05), ("running", "checking", 0.85)]
+            stages += [("failed", None, 0.0)] if self.plan_failure else [("succeeded", "done", 1.0)]
+        else:
+            stages += [("running", f"shot {i}/{count}", (i - 1) / count) for i in range(1, count + 1)] if count else [("running", "rendering", 0.5)]
+            stages += [("succeeded", "done", 1.0)]
         job = SimpleNamespace(job_id=job_id, params=params, privacy=privacy, stages=stages, step=0, video=b"", receipt=None,
-                              output_blob_id=None, price=PROFILES[params.profile_id].price_usd(params, privacy), **extra)
+                              output_blob_id=None, price=PROFILES[params.profile_id].price_usd(params, privacy), plan=None,
+                              error_code=self.plan_failure if params.mode is Mode.PLAN else None, **extra)
         self.jobs[job_id] = job
         return job
 
@@ -161,15 +193,24 @@ class FakeNetwork:
         job = self._job(body["job_id"], GenerationParams.model_validate(body["params"]), "standard", body=body)
         return httpx.Response(201, json=self.status_json(job))
 
+    def create_standard_plan(self, body: dict) -> httpx.Response:
+        params = GenerationParams.model_validate(body["params"])
+        options = dict(body.get("options") or {})
+        if body.get("style"):
+            options["style"] = body["style"]
+        payload = SealedPayload(prompt=body["brief"], seed=body.get("seed"), options={PLAN_OPTION: options})
+        job = self._job(body.get("job_id") or str(uuid.uuid4()), params, "standard", body=body, payload=payload)
+        return httpx.Response(201, json=self.status_json(job))
+
     def poll(self, job_id: str) -> httpx.Response:
         job = self.jobs.get(job_id)
         if job is None:
             return detail(404, "not_found", "No such video job.")
         response = httpx.Response(200, json=self.status_json(job))
-        if job.stages[job.step][0] not in ("succeeded", "canceled"):
+        if job.stages[job.step][0] not in ("succeeded", "canceled", "failed"):
             job.step += 1
             if job.stages[job.step][0] == "succeeded":
-                self._render(job)
+                self._plan(job) if job.params.mode is Mode.PLAN else self._render(job)
         return response
 
     def cancel(self, job_id: str) -> httpx.Response:
@@ -194,6 +235,39 @@ class FakeNetwork:
         )
         job.receipt = sign_receipt(self.signing_key, body)
 
+    def _plan(self, job: SimpleNamespace) -> None:
+        """A canned plan/1 reply for the brief, repaired and fitted by kuno_protocol.plans as the worker does."""
+        profile, payload = PROFILES[job.params.profile_id], job.payload
+        options = PlanOptions.model_validate(payload.options.get(PLAN_OPTION) or {})
+        context = plan_context(profile, job.params, options)
+        count, length = suggested_shots(context)
+        revise = options.revise
+        if revise is not None:
+            count = len(revise.plan.shots)
+        subject = " ".join(payload.prompt.split()[:8]).rstrip(".") or "the harbor"
+        tone = f" {revise.instruction.rstrip('.')}." if revise is not None and revise.instruction else ""
+        shots = [
+            {"beat": f"Beat {i + 1}", "prompt": f"{('Wide shot', 'Close-up shot')[i % 2]}; {subject}.{tone} Soft room tone is heard.",
+             "duration_s": length, "join": "fresh" if i == 0 else "cut"}
+            for i in range(count)
+        ]
+        reply = json.dumps({"title": "Fake plan", "scene": "A quiet harbor at dawn, soft light.", "shots": shots, "notes": "Canned."})
+        job.plan = repair(reply, context, planner="fake/1:canned", brief=payload.prompt, revise=revise).deliverable()
+        data = encode_plan(job.plan)
+        stored = data
+        if job.privacy == "private":
+            data, stored = seal_plan(job.output_key, job.job_id, job.plan)
+            job.output_blob_id = uuid.uuid4().hex
+            self.blobs[job.output_blob_id] = stored
+        body = ReceiptBody(
+            job_id=job.job_id, enclave_id=self.enclave["enclave_id"], profile_id=job.params.profile_id, image_digest="0" * 64,
+            params_digest="0" * 64, input_digest="0" * 64, output_digest=sha256_hex(stored), output_bytes=len(stored),
+            content_digest=sha256_hex(data), attestation_digest="0" * 64, started_at=1.0, finished_at=2.0, gpu_seconds=1.0,
+            plan=PlanInfo(shots=len(job.plan.shots), duration_s=job.plan.duration_s, planner=job.plan.planner.model,
+                          prompt_version=job.plan.planner.prompt_version, output_tokens=100),
+        )
+        job.receipt = sign_receipt(self.signing_key, body)
+
     def status_json(self, job: SimpleNamespace) -> dict:
         state, stage, progress = job.stages[job.step]
         succeeded = state == "succeeded" and job.receipt is not None
@@ -203,5 +277,7 @@ class FakeNetwork:
             "price_usd": job.price, "created_at": 1.0, "updated_at": 2.0,
             "output_blob_id": job.output_blob_id if succeeded else None,
             "receipt": job.receipt.model_dump(mode="json") if succeeded else None,
-            "error_code": None, "error": None, "privacy": job.privacy,
+            "error_code": job.error_code if state == "failed" else None,
+            "error": "The planner could not write a usable plan for this brief." if state == "failed" else None,
+            "privacy": job.privacy,
         }

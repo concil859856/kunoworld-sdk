@@ -3,7 +3,9 @@
 A Private job's handle holds its output key, the only thing that opens the video: lose it and the video is lost, leak it
 and whoever has the sealed file can watch. So handles live in one file per job under a directory only this user can
 enter (0700), each file readable only by this user (0600), written to a temporary file and renamed so a crash never
-leaves half a key. Nothing here is sent anywhere, and no prompt is ever stored.
+leaves half a key. Nothing here is sent anywhere, and no prompt or brief is ever stored. A plan job's file also keeps the
+finished plan (its title, scene and shot prompts, as the enclave wrote them), so an agent can revise or render it by id:
+in Private mode that file is the only readable copy of the plan outside the conversation.
 """
 
 from __future__ import annotations

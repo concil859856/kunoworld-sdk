@@ -13,7 +13,9 @@ export type Mode =
   | "extend_video"
   | "audio_to_video"
   | "retake"
-  | "storyboard";
+  | "storyboard"
+  /** A storyboard plan written from a brief inside the enclave, delivered as sealed JSON instead of a video (plans.ts). */
+  | "plan";
 
 export type InputRole =
   | "first_frame"
@@ -62,6 +64,17 @@ export interface StoryboardLimits {
   overlap_latent_frames?: number;
 }
 
+/** What a profile's plan mode accepts (PROTOCOL.md "Plans (Director)"). A plan's shots also keep to `storyboard`. */
+export interface PlanLimits {
+  /** The shortest stitched length a plan may target; `storyboard.max_total_s` is the longest. */
+  min_target_s: number;
+  max_brief_chars?: number;
+  max_style_chars?: number;
+  max_new_tokens?: number;
+  planner?: string;
+  prompt_version?: string;
+}
+
 export interface InputGroup {
   roles: InputRole[];
   max: number;
@@ -87,6 +100,8 @@ export interface Limits {
   max_duration_s_by_fps?: Record<string, number>;
   /** Set where the profile offers storyboard mode. */
   storyboard?: StoryboardLimits | null;
+  /** Set where the profile offers plan mode, which also needs `storyboard`. */
+  plan?: PlanLimits | null;
 }
 
 /** A profile's prices. Every price is a placeholder while `pricing_placeholder` is true. */
@@ -101,6 +116,10 @@ export interface Pricing {
   long_clip?: { over_s: number; multiplier: number } | null;
   /** fps -> a multiplier on the whole job. */
   fps_multipliers?: Record<string, number>;
+  /** A plan job's flat price in Private mode: not per second, no multipliers, no minimum. Absent: no plans. */
+  plan_usd?: number | null;
+  /** A plan job's flat price in Standard mode. */
+  standard_plan_usd?: number | null;
 }
 
 /**
@@ -111,6 +130,8 @@ export interface VcuWeights {
   per_output_second: Record<string, number>;
   duration_slope?: number;
   fps_multiplier?: Record<string, number>;
+  /** A plan job's flat VCU. */
+  plan?: number | null;
   note?: string | null;
 }
 
@@ -217,6 +238,15 @@ export interface VideoInfo {
   audio: boolean;
 }
 
+/** What a plan job delivered: its shot count and stitched length, the planner, and the tokens it generated. */
+export interface PlanInfo {
+  shots: number;
+  duration_s: number;
+  planner: string;
+  prompt_version: string;
+  output_tokens: number;
+}
+
 export interface ReceiptBody {
   v: 1;
   job_id: string;
@@ -232,7 +262,10 @@ export interface ReceiptBody {
   started_at: number;
   finished_at: number;
   gpu_seconds: number;
-  video: VideoInfo;
+  /** A video job's output. A plan job's receipt has `plan` instead: exactly one of the two is present. */
+  video?: VideoInfo;
+  /** A plan job's output; `content_digest` is then the SHA-256 of the plan's JSON. */
+  plan?: PlanInfo;
   miner_hotkey: string | null;
 }
 
@@ -319,6 +352,8 @@ export interface EnclaveInfo {
   envelope?: ServingEnvelope | null;
   /** What Intel and NVIDIA signed for `evidence` (endorsements.ts); null for simulated workers and older gateways. */
   endorsements?: Endorsements | null;
+  /** Optional job kinds the worker serves beyond rendering, e.g. `plan/1`. Absent on gateways from before features. */
+  features?: string[] | null;
 }
 
 /** resolution -> aspect ratio -> fps -> the longest duration_s served. A size or frame rate left out is not served. */
