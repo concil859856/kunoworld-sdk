@@ -46,7 +46,7 @@ export const ERROR_CODES = {
   unauthorized: "The API key (or web session) was missing, unknown or revoked.",
   gone: "This endpoint or credential was retired. Studio tokens (kwt_…) no longer work: use an API key, or a same-origin proxy that holds a web session.",
   content_policy: "The request breaks the content policy, so the job wasn't created. All NSFW content is banned in both modes. Nothing was charged.",
-  safety_blocked: "The content check inside the enclave blocked the request before rendering. It counts as a strike.",
+  safety_blocked: "The content check inside the enclave blocked the request before rendering. It counts as a strike, unless the blocked text was written by the enclave's own model (an enhanced prompt or a plan).",
   content_not_reviewable: "Operators only: this item's content can't be opened, because it isn't a report of child sexual abuse material or sexual content involving a minor, and no matching legal hold covers it.",
   key_not_accepted: "An output_key can be attached to a report only when the reason is csam or sexual_minor.",
   private_mode_not_eligible: "This account can't make private jobs yet; see `reasons`.",

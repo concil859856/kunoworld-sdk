@@ -105,7 +105,7 @@ refunded, so rephrase the brief (shorter, concrete, with the length and what hap
 - No harassment, threats, incitement to violence, or infringement of someone's intellectual property, privacy or
   publicity rights.
 - Every prompt and shot is checked: by the gateway in Standard mode (`content_policy`, before the job exists), inside
-  the enclave in Private mode (`safety_blocked`, refunded). Either costs nothing but counts as a strike, and repeated
+  the enclave in Private mode (`safety_blocked`, refunded). Either costs nothing but counts as a strike (except a block of text the enclave's own model wrote, such as an enhanced prompt or a plan), and repeated
   strikes restrict the account. Don't reword a blocked prompt to slip past the check; decline the request instead.
 - MiniMax H3's licence requires that its videos shared publicly are clearly disclosed as machine-generated. Suggest the
   same for any AI video the user publishes.

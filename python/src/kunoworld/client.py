@@ -74,7 +74,7 @@ ERROR_CODES: dict[str, str] = {
     "invalid_params": "The request doesn't fit the model's limits (duration, size, frame rate, or a storyboard's shots).",
     "invalid_shots": "A storyboard needs one non-empty prompt per shot, and only storyboards take shots.",
     "prompt_too_long": "A prompt is over the model's limit; for a storyboard, the scene and one shot's prompt together.",
-    "safety_blocked": "The content check inside the enclave blocked the request before rendering. It counts as a strike.",
+    "safety_blocked": "The content check inside the enclave blocked the request before rendering. It counts as a strike, unless the blocked text was written by the enclave's own model (an enhanced prompt or a plan).",
     "content_not_reviewable": "Operators only: this item's content can't be opened, because it isn't a report of child "
     "sexual abuse material or sexual content involving a minor, and no matching legal hold covers it.",
     "key_not_accepted": "An output_key can be attached to a report only when the reason is csam or sexual_minor.",

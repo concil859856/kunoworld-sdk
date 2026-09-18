@@ -124,7 +124,7 @@ strikes_24h, strikes_7d }`.
 | `invalid_budget` (before sending) | `maxPriceUsd` isn't an amount of zero or more |
 | `quote_mismatch` (before sending) | the gateway quoted other params than the job about to be sent (routing changed in between); try again |
 | `invalid_shots` / `invalid_inputs` (before sending a quote) | a quote for a storyboard without shots, shots on another mode, or shots with inputs |
-| `safety_blocked` | the in-enclave content check stopped the job; it counts as a strike |
+| `safety_blocked` | the in-enclave content check stopped the job; it counts as a strike unless the blocked text was the enclave's own (an enhanced prompt or a plan) |
 | `bad_output` | the video didn't match its receipt, so the job failed and was refunded |
 | `deleted` / `removed` (410) | the video was deleted by its owner, or removed after review |
 | `key_not_accepted` (422) | a report carried an `output_key` but its reason isn't `csam` or `sexual_minor` |

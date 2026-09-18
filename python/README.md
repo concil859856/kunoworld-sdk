@@ -114,7 +114,7 @@ operator credit, no active restriction and fewer than 2 blocked jobs in 30 days.
 | `quote_mismatch` (before sending) | the gateway quoted other params than the job about to be sent (routing changed in between); try again |
 | `invalid_shots` (422, or before sending) | a storyboard without one non-empty prompt per shot, or `shots` on a job that isn't a storyboard |
 | `prompt_too_long` (422, or before sending) | a prompt, or a storyboard's scene and one shot's prompt together, is over the model's limit |
-| `safety_blocked` | the in-enclave content check stopped the job; it counts as a strike |
+| `safety_blocked` | the in-enclave content check stopped the job; it counts as a strike unless the blocked text was the enclave's own (an enhanced prompt or a plan) |
 | `bad_output` | the video didn't match its receipt, so the job failed and was refunded |
 | `deleted` / `removed` (410) | the video was deleted by its owner, or removed after review |
 | `key_not_accepted` (422) | a report carried an `output_key` but its reason isn't `csam` or `sexual_minor` |
