@@ -5,8 +5,9 @@ GPU enclave whose attestation evidence it checks first; verifies the enclave-sig
 and decrypts the finished video locally. Requires Python 3.10+.
 
 > **Development preview.** Workers on development gateways use simulated attestation and may
-> return placeholder video. Real TDX and NVIDIA evidence verification is not built yet. Prices
-> are placeholders that haven't been set (`models()` may include `"pricing_placeholder": true`).
+> return placeholder video. The TDX and NVIDIA checks are built and tested against Intel's real sample quotes and
+> NVIDIA's real signing certificates, but no live confidential GPU worker has run yet. Prices are launch estimates
+> (`models()` may include `"pricing_placeholder": true`).
 
 **API keys are for developers**, calling KunoWorld from programs they run; create one on your
 account page. People using the KunoWorld website sign in with their email instead, and the site
